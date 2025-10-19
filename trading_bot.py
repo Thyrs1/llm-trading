@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 # Correct, modern imports for Google GenAI SDK
 import google.generativeai as genai
 from google.generativeai import types
+from google.api_core import exceptions
 
 # --- Local Imports ---
 import config
@@ -113,10 +114,9 @@ except Exception as e:
     exit()
 
 try:
-    # Correctly initialize the Gemini AI client
-    genai.configure(api_key=config.GOOGLE_API_KEY) # type: ignore
-    gemini_model = genai.GenerativeModel('gemini-2.5-flash-latest') # type: ignore
-    add_log("✅ Gemini AI client initialized (gemini-2.5-flash-latest).")
+    # We no longer configure a global key. It will be set per-request.
+    gemini_model = genai.GenerativeModel('gemini-2.5-pro') # type: ignore
+    add_log(f"✅ Gemini AI model loaded. Using {len(config.GEMINI_API_KEYS)} API keys for rotation.")
 except Exception as e:
     add_log(f"❌ Gemini AI initialization failed: {e}")
     exit()
@@ -221,37 +221,57 @@ def run_heavy_analysis():
     return all_data_content
 
 def get_gemini_decision(analysis_data):
-    """Requests Gemini for a structured trading decision with dynamic risk parameters."""
-    add_log("🧠 Requesting Gemini strategy...")
+    """
+    Requests Gemini for a structured trading decision, rotating API keys to handle rate limits.
+    """
+    global current_key_index
+    add_log("🧠 Requesting Gemini strategy with key rotation...")
     
     system_instruction = (
-        "You are an AI quantitative trading strategist. Your final output MUST be a single JSON object conforming to the provided schema. "
-        "Dynamically set risk parameters based on the confidence derived from the data synthesis."
+        "You are an AI quantitative trading strategist. Your final output MUST be a single JSON object..."
     )
+    prompt = f"Analyze the following data...\n{analysis_data}\nReturn the JSON object now."
 
-    prompt = f"""
-    Analyze the following comprehensive market data for {config.SYMBOL}.
-    Synthesize all layers of data (Vitals and K-lines) to determine the highest probability trade.
-    Here is the full data bundle:
-    {analysis_data}
-    Return the JSON object now.
-    """
-    
-    try:
-        response = gemini_model.generate_content(
-            prompt,
-            generation_config=types.GenerationConfig(
-                response_mime_type="application/json",
-                response_schema=TRADE_DECISION_SCHEMA,
-                temperature=0,
+    # Loop through all available keys, retrying on rate limit errors
+    for i in range(len(config.GEMINI_API_KEYS)):
+        try:
+            # Select the next key in the list (round-robin)
+            key = config.GEMINI_API_KEYS[current_key_index]
+            add_log(f"Attempting API call with key index {current_key_index}...")
+            
+            # Configure the SDK with the current key for this attempt
+            genai.configure(api_key=key) # type: ignore
+            
+            # Move to the next key for the subsequent call
+            current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
+
+            # Make the API call
+            response = gemini_model.generate_content(
+                prompt,
+                generation_config=types.GenerationConfig(
+                    response_mime_type="application/json",
+                    response_schema=TRADE_DECISION_SCHEMA,
+                    temperature=0,
+                )
             )
-        )
-        
-        decision = json.loads(response.text)
-        return decision
-    except Exception as e:
-        add_log(f"❌ Failed to parse Gemini response: {e}")
-        return None
+            
+            decision = json.loads(response.text)
+            add_log("✅ Gemini decision received successfully.")
+            return decision # Success, exit the function
+
+        except exceptions.ResourceExhausted as e:
+            add_log(f"⚠️ Gemini API key at index {current_key_index-1} is rate-limited. Switching to next key...")
+            # The loop will automatically try the next key
+            continue
+        except Exception as e:
+            add_log(f"❌ An unexpected error occurred during Gemini API call: {e}")
+            # For non-rate-limit errors, we stop trying
+            return None
+
+    # This part is reached only if all keys failed
+    add_log("🚨 All Gemini API keys are rate-limited. Pausing for 60 seconds...")
+    time.sleep(60)
+    return None
 
 # --- 6. Trading Execution and Management Functions ---
 

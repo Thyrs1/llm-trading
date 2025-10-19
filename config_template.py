@@ -3,7 +3,15 @@
 # --- API Keys ---
 BINANCE_API_KEY = "YOUR_BINANCE_TESTNET_API_KEY"
 BINANCE_API_SECRET = "YOUR_BINANCE_TESTNET_API_SECRET"
-GOOGLE_API_KEY = "YOUR_GOOGLE_AI_STUDIO_API_KEY"
+
+# --- NEW: List of Gemini API Keys for Rotation ---
+# Add as many keys as you have to avoid rate limits.
+GEMINI_API_KEYS = [
+    "YOUR_FIRST_GEMINI_API_KEY",
+    "YOUR_SECOND_GEMINI_API_KEY",
+    "YOUR_THIRD_GEMINI_API_KEY", # Add more if needed
+]
+
 TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
 TELEGRAM_CHAT_ID = "YOUR_PERSONAL_OR_GROUP_CHAT_ID"
 
@@ -11,8 +19,8 @@ TELEGRAM_CHAT_ID = "YOUR_PERSONAL_OR_GROUP_CHAT_ID"
 BINANCE_TESTNET = True
 
 # --- Core Capital and Risk Management ---
-TOTAL_CAPITAL_USDT = 10000.0  # Total trading capital in USDT
-MAX_RISK_PER_TRADE = 0.03  # Max risk per trade (3% of capital)
+TOTAL_CAPITAL_USDT = 10000.0
+MAX_RISK_PER_TRADE = 0.03
 
 # --- Trading Parameters ---
 SYMBOL = "SOLUSDT"
