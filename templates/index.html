@@ -1,4 +1,4 @@
-<!-- templates/index.html (v2 - AI-Driven Dashboard) -->
+<!-- templates/index.html (v3 - Updated for new key names) -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -36,11 +36,12 @@
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
         .action-plan-details { margin-top: 10px; font-family: 'SF Mono', 'Courier New', monospace; }
         .action-plan-details div { margin-bottom: 5px; }
-        .action-plan-details .label { color: var(--subtle-text); display: inline-block; width: 100px; }
+        .action-plan-details .label { color: var(--subtle-text); display: inline-block; width: 110px; } /* Increased width for better alignment */
     </style>
 </head>
 <body>
     <div class="container">
+        <!-- All other cards remain the same -->
         <div class="card grid-col-span-2">
             <h2>Bot Status</h2>
             <div class="status-grid">
@@ -89,7 +90,11 @@
         const botStartTime = Date.now();
 
         function formatNumber(num, digits = 4) {
-            return num ? parseFloat(num).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: digits }) : '--';
+            // Check for both null and undefined, and also handle 0 correctly
+            if (num === null || typeof num === 'undefined') {
+                return '--';
+            }
+            return parseFloat(num).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: digits });
         }
 
         function updateUptime() {
@@ -110,15 +115,20 @@
                 return;
             }
 
-            const action = decision.action;
+            const action = decision.action.toLowerCase(); // Use lowercase for robust matching
             let detailsHtml = '';
+            
+            // Normalize keys to lowercase to match the parser's output
+            const d = Object.fromEntries(
+                Object.entries(decision).map(([k, v]) => [k.toLowerCase(), v])
+            );
 
-            if (action === 'WAIT') {
-                const trigger = decision.next_analysis_trigger;
-                if (trigger === 'PRICE_CROSS') {
+            if (action === 'wait') {
+                const trigger = d.next_analysis_trigger;
+                if (trigger && trigger.toLowerCase() === 'price_cross') {
                     detailsHtml = `<div class="status-item">
                                        <span>Trigger Condition</span>
-                                       <span style="font-size: 1.5em;">🎯 ${decision.trigger_direction} ${formatNumber(decision.trigger_price)}</span>
+                                       <span style="font-size: 1.5em;">🎯 ${d.trigger_direction} ${formatNumber(d.trigger_price)}</span>
                                    </div>`;
                 } else {
                     detailsHtml = `<div class="status-item">
@@ -126,24 +136,25 @@
                                        <span style="font-size: 1.5em;">Continuous Monitoring</span>
                                    </div>`;
                 }
-            } else if (action === 'OPEN_POSITION') {
+            } else if (action === 'open_position') {
                 detailsHtml = `
                     <div class="action-plan-details">
-                        <div><span class="label">Direction:</span> <strong>${decision.decision}</strong></div>
-                        <div><span class="label">Confidence:</span> ${decision.confidence}</div>
-                        <div><span class="label">Entry:</span> ${formatNumber(decision.entry_price)}</div>
-                        <div><span class="label">Stop Loss:</span> ${formatNumber(decision.stop_loss)}</div>
-                        <div><span class="label">Take Profit:</span> ${formatNumber(decision.take_profit)}</div>
-                        <div><span class="label">Leverage:</span> ${decision.leverage}x</div>
-                        <div><span class="label">Risk:</span> ${decision.risk_per_trade_percent}%</div>
+                        <div><span class="label">Direction:</span> <strong>${d.decision || '--'}</strong></div>
+                        <div><span class="label">Confidence:</span> ${d.confidence || '--'}</div>
+                        <div><span class="label">Entry:</span> ${formatNumber(d.entry_price)}</div>
+                        <div><span class="label">Stop Loss:</span> ${formatNumber(d.stop_loss)}</div>
+                        <div><span class="label">Take Profit:</span> ${formatNumber(d.take_profit)}</div>
+                        <div><span class="label">Leverage:</span> ${d.leverage || '--'}x</div>
+                        <!-- *** THIS IS THE FIX *** -->
+                        <div><span class="label">Risk:</span> ${d.risk_percent || '--'}%</div>
                     </div>`;
-            } else if (action === 'MODIFY_POSITION') {
+            } else if (action === 'modify_position') {
                  detailsHtml = `
                     <div class="action-plan-details">
-                        <div><span class="label">New SL:</span> ${formatNumber(decision.new_stop_loss) || 'Unchanged'}</div>
-                        <div><span class="label">New TP:</span> ${formatNumber(decision.new_take_profit) || 'Unchanged'}</div>
+                        <div><span class="label">New SL:</span> ${formatNumber(d.new_stop_loss) || 'Unchanged'}</div>
+                        <div><span class="label">New TP:</span> ${formatNumber(d.new_take_profit) || 'Unchanged'}</div>
                     </div>`;
-            } else if (action === 'CLOSE_POSITION') {
+            } else if (action === 'close_position') {
                 detailsHtml = `<div class="status-item"><span>Instruction</span><span style="font-size: 1.5em;">Close position at market.</span></div>`;
             }
 
@@ -159,46 +170,11 @@
                 // Bot Status Card
                 const stateEl = document.getElementById('bot-state');
                 const stateText = data.bot_state || '--';
-                if (stateText === 'ANALYZING') {
+                if (stateText.toLowerCase() === 'analyzing') {
                     stateEl.innerHTML = `<div class="spinner"></div>ANALYZING`;
                 } else {
                     stateEl.innerHTML = stateText;
                 }
                 stateEl.className = 'state-' + (data.bot_state || 'UNKNOWN');
                 document.getElementById('symbol').textContent = data.symbol || '--';
-                document.getElementById('last-update').textContent = data.last_update ? new Date(data.last_update).toLocaleTimeString() : '--';
-
-                // Position Card
-                document.getElementById('pos-side').textContent = data.position.side || 'FLAT';
-                document.getElementById('pos-entry').textContent = formatNumber(data.position.entry_price);
-                document.getElementById('pos-size').textContent = data.position.quantity ? `${data.position.quantity} ${data.symbol.replace('USDT','')}` : '--';
-                
-                const pnlEl = document.getElementById('pnl');
-                if (data.pnl && data.pnl.usd !== null) {
-                    pnlEl.textContent = `${formatNumber(data.pnl.usd)} USDT (${data.pnl.percentage.toFixed(2)}%)`;
-                    pnlEl.className = data.pnl.usd >= 0 ? 'positive' : 'negative';
-                } else { pnlEl.textContent = '--'; pnlEl.className = ''; }
-
-                // Gemini Cards
-                const decision = data.last_gemini_decision;
-                document.getElementById('action').textContent = decision ? decision.action : '--';
-                document.getElementById('reasoning').textContent = decision ? decision.reasoning : 'Awaiting first analysis...';
-                renderActionDetails(decision);
-
-                // Activity Log
-                const logEl = document.getElementById('activity-log');
-                logEl.innerHTML = '';
-                if (data.log && data.log.length > 0) { data.log.forEach(entry => { const li = document.createElement('li'); li.textContent = entry; logEl.appendChild(li); });
-                } else { logEl.innerHTML = '<li>No activity yet.</li>'; }
-
-            } catch (error) {
-                console.error("Error fetching status:", error);
-            }
-        }
-
-        setInterval(fetchStatus, 3000);
-        setInterval(updateUptime, 1000);
-        document.addEventListener('DOMContentLoaded', fetchStatus);
-    </script>
-</body>
-</html>
+                document.getElementById('last-update').textContent = data.last_update ? new Date(da
