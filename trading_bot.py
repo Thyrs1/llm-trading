@@ -40,6 +40,9 @@ last_gemini_decision = {}
 pending_order_id = None
 pending_order_start_time = 0
 current_key_index = 0
+# --- NEW: Global variables for exchange precision rules ---
+price_precision = 2  # Default, will be updated on startup
+quantity_precision = 3 # Default, will be updated on startup
 
 # --- 2. Utility Functions ---
 def save_status():
@@ -76,6 +79,15 @@ try:
     except BinanceAPIException as e:
         if e.code == -4046: add_log("✅ Margin type was already ISOLATED.")
         else: raise e
+    add_log("Fetching exchange information for precision rules...")
+    exchange_info = binance_client.futures_exchange_info()
+    for s in exchange_info['symbols']:
+        if s['symbol'] == config.SYMBOL:
+            price_precision = s['pricePrecision']
+            quantity_precision = s['quantityPrecision']
+            add_log(f"✅ Precision rules for {config.SYMBOL}: Price={price_precision}, Quantity={quantity_precision}")
+            break
+
 except Exception as e:
     add_log(f"❌ Binance initialization failed: {e}")
     exit()
