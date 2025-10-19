@@ -133,7 +133,7 @@ class WaitParams(BaseModel):
     
     # --- PRECISION INSTRUCTION ADDED ---
     trigger_price: float = Field(description="Required if trigger is 'PRICE_CROSS' (format: '%.2f'). Set to 0 otherwise.")
-    trigger_timeout: int = Field(description="Required if trigger is 'PRICE_CROSS' Time in seconds to wait for the trigger condition before re-analyzing.")
+    trigger_timeout: int = Field(description="Required if trigger is 'PRICE_CROSS' Time in seconds to wait for the trigger condition before re-analyzing, setting a low value is recommended.")
     trigger_direction: str = Field(description="Required if trigger is 'PRICE_CROSS': 'ABOVE' or 'BELOW'. Set to 'NULL' otherwise.")
 
 # --- MASTER PROMPT FOR MEMORY REFRESH ---
@@ -220,9 +220,9 @@ def run_heavy_analysis():
         atr_percentage = (latest.get('ATRr_14', 0) / latest['close']) * 100 if latest['close'] > 0 else 0
         volume_strength = latest.get('volume', 0) / latest.get('volume_ma_20', 1) if latest.get('volume_ma_20', 0) > 0 else 0
         report = f"--- Analysis Report ({tf} Timeframe) ---\n"
-        report += f"Close Price: {latest['close']:.4f}\n"
+        report += f"Close Price: {latest['close']:.2f}\n"
         report += f"Trend Strength (ADX_14): {latest.get('ADX_14', 0):.2f}\n"
-        report += f"EMA 20/50: {latest.get('EMA_20', 0):.4f} / {latest.get('EMA_50', 0):.4f}\n"
+        report += f"EMA 20/50: {latest.get('EMA_20', 0):.2f} / {latest.get('EMA_50', 0):.2f}\n"
         report += f"RSI_14: {latest.get('RSI_14', 0):.2f}\n"
         report += f"ATR_Volatility_Percent: {atr_percentage:.2f}%\n"
         report += f"Volume_Strength_Ratio: {volume_strength:.2f}x\n"
@@ -404,8 +404,8 @@ def open_position(decision):
         return
     add_log(f"💎 Decision: {side} | Size: {position_size} | Risk: {risk_percent}%")
     try:
-        order = binance_client.futures_create_order(symbol=config.SYMBOL, side='BUY' if side == 'LONG' else 'SELL', type='LIMIT', timeInForce='GTC', price=f"{entry_price:.4f}", quantity=position_size, newOrderRespType='RESULT', isMakers=True)
-        add_log(f"✅ Post-Only Limit Order placed @ {entry_price:.4f} (ID: {order['orderId']})")
+        order = binance_client.futures_create_order(symbol=config.SYMBOL, side='BUY' if side == 'LONG' else 'SELL', type='LIMIT', timeInForce='GTC', price=f"{entry_price:.2f}", quantity=position_size, newOrderRespType='RESULT', isMakers=True)
+        add_log(f"✅ Post-Only Limit Order placed @ {entry_price:.2f} (ID: {order['orderId']})")
         # Logic to handle pending order and SL/TP placement would go here
     except BinanceAPIException as e:
         if e.code == -2021: add_log("⚠️ Order failed: Price would execute immediately (Taker).")
@@ -430,12 +430,12 @@ def modify_position(decision, position):
         side = position['side']
         if sl_price:
             sl_side = 'SELL' if side == 'LONG' else 'BUY'
-            binance_client.futures_create_order(symbol=config.SYMBOL, side=sl_side, type='STOP_MARKET', stopPrice=f"{sl_price:.4f}", closePosition=True)
-            add_log(f"✅ New Stop Loss set @ {sl_price:.4f}")
+            binance_client.futures_create_order(symbol=config.SYMBOL, side=sl_side, type='STOP_MARKET', stopPrice=f"{sl_price:.2f}", closePosition=True)
+            add_log(f"✅ New Stop Loss set @ {sl_price:.2f}")
         if tp_price:
             tp_side = 'SELL' if side == 'LONG' else 'BUY'
-            binance_client.futures_create_order(symbol=config.SYMBOL, side=tp_side, type='TAKE_PROFIT_MARKET', stopPrice=f"{tp_price:.4f}", closePosition=True)
-            add_log(f"✅ New Take Profit set @ {tp_price:.4f}")
+            binance_client.futures_create_order(symbol=config.SYMBOL, side=tp_side, type='TAKE_PROFIT_MARKET', stopPrice=f"{tp_price:.2f}", closePosition=True)
+            add_log(f"✅ New Take Profit set @ {tp_price:.2f}")
     except BinanceAPIException as e:
         add_log(f"❌ Failed to modify position: {e}")
 
