@@ -1,0 +1,3 @@
+config==0.5.1
+python_binance==1.0.30
+Requests==2.32.5
