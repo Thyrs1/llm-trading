@@ -1,6 +1,8 @@
 # Ignore config files containing sensitive information and runtime files
 config.py
 status.json
+run.sh
+run.bat
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
