@@ -123,7 +123,7 @@ Analyze the provided market data and current position. Formulate a complete trad
     *   `STOP_LOSS`: The mandatory stop loss price.
     *   `TAKE_PROFIT`: The initial take profit price.
     *   `LEVERAGE`: The integer leverage to use.
-    *   `RISK_PERCENT`: The percentage of capital to risk.
+    *   `RISK_PERCENT`: The percentage of capital to risk. 20.0 at minimum. 90.0 at maximum.
 
 *   **--- If ACTION is `WAIT`, you MUST also include:**
     *   `TRIGGER_PRICE`: The price that triggers the next analysis.
@@ -509,13 +509,16 @@ def open_position(decision):
     global bot_status, last_gemini_decision
     bot_status['bot_state'] = "ORDER_PENDING"
     
+    # --- MODIFICATION START ---
+    # Use the new, consistent, lowercase key names from our parser
     side = decision.get('decision')
     entry_price = decision.get('entry_price')
     stop_loss_price = decision.get('stop_loss')
     leverage = decision.get('leverage')
-    risk_percent = decision.get('risk_per_trade_percent')
+    risk_percent = decision.get('risk_percent') # CORRECTED KEY NAME
+    # --- MODIFICATION END ---
     
-    if not all([side, entry_price, stop_loss_price, leverage, risk_percent]):
+    if not all([side, entry_price, stop_loss_price, leverage, risk_percent is not None]): # Added 'is not None' for robustness
         add_log(f"❌ Gemini OPEN decision missing required fields. Decision: {decision}")
         bot_status['bot_state'] = "SEARCHING"
         return
@@ -530,7 +533,7 @@ def open_position(decision):
 
     position_size = calculate_position_size(entry_price, stop_loss_price, risk_percent)
     if position_size <= 0:
-        add_log("Calculated position size is zero, trade cancelled.")
+        add_log("Calculated position size is zero or invalid, trade cancelled.")
         bot_status['bot_state'] = "SEARCHING"
         return
         
