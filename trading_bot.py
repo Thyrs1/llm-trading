@@ -1,4 +1,4 @@
-# trading_bot.py (v7 - Final Stable Version)
+# trading_bot.py (v9 - Final, Corrected Initialization)
 
 # --- Standard Library Imports ---
 import os
@@ -53,7 +53,6 @@ pending_order_start_time = 0
 def save_status():
     """Writes the global status dictionary to a JSON file for the dashboard."""
     bot_status['last_update'] = datetime.now(timezone.utc).isoformat()
-    # Create a serializable copy of the status
     status_to_save = bot_status.copy()
     status_to_save['log'] = list(bot_status['log'])
     try:
@@ -65,7 +64,7 @@ def save_status():
 def add_log(message):
     """Adds a timestamped entry to the log, prints it, and saves the status."""
     log_entry = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}"
-    bot_status['log'].appendleft(log_entry) # Add to the top of the list
+    bot_status['log'].appendleft(log_entry)
     print(log_entry)
     save_status()
 
@@ -75,24 +74,28 @@ def add_log(message):
 FUTURES_TESTNET_URL = "https://testnet.binancefuture.com"
 
 try:
-    # Initialize Binance Client with the correct endpoint for Futures Testnet
-    # Pylance may still warn about 'base_url', but it is a valid and required parameter.
+    # --- CRITICAL FIX for Initialization ---
+    # 1. Initialize Binance Client WITHOUT the base_url parameter
+    add_log("Initializing Binance client...")
     binance_client = Client(
-        config.BINANCE_API_KEY,
-        config.BINANCE_API_SECRET,
-        testnet=config.BINANCE_TESTNET,
-        # This is the critical fix for all futures-related API calls on testnet
-        base_url=FUTURES_TESTNET_URL if config.BINANCE_TESTNET else None
+        config.BINANCE_API_KEY, 
+        config.BINANCE_API_SECRET, 
+        testnet=config.BINANCE_TESTNET
     )
     
-    # Manually synchronize time to prevent timestamp errors (-1021)
+    # 2. Manually override the API URL if on Testnet
+    if config.BINANCE_TESTNET:
+        binance_client.API_URL = FUTURES_TESTNET_URL
+        add_log(f"✅ Client API URL manually set to Futures Testnet: {binance_client.API_URL}")
+
+    # 3. Manually synchronize time
     server_time = binance_client.get_server_time()['serverTime']
     binance_client.timestamp_offset = server_time - int(time.time() * 1000)
     add_log("✅ Time synchronization successful.")
 
-    add_log(f"✅ Binance client initialized (Testnet: {config.BINANCE_TESTNET}).")
+    add_log(f"✅ Binance client initialization successful (Testnet: {config.BINANCE_TESTNET}).")
 
-    # Set Margin Type (ISOLATED) and handle harmless "already set" error
+    # 4. Set Margin Type and handle harmless "already set" error
     try:
         binance_client.futures_change_margin_type(symbol=config.SYMBOL, marginType='ISOLATED')
         add_log("✅ Margin type set to ISOLATED.")
@@ -100,7 +103,7 @@ try:
         if e.code == -4046: # "No need to change margin type."
             add_log("✅ Margin type was already ISOLATED.")
         else:
-            raise e # Re-raise other critical API errors
+            raise e
     
 except BinanceAPIException as e:
     add_log(f"❌ Binance initialization failed: APIError(code={e.code}): {e.message}")
@@ -110,9 +113,9 @@ except Exception as e:
     exit()
 
 try:
-    # Correctly initialize the Gemini AI client using the standard alias
-    genai.configure(api_key=config.GOOGLE_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-2.5-flash-latest')
+    # Correctly initialize the Gemini AI client
+    genai.configure(api_key=config.GOOGLE_API_KEY) # type: ignore
+    gemini_model = genai.GenerativeModel('gemini-2.5-flash-latest') # type: ignore
     add_log("✅ Gemini AI client initialized (gemini-2.5-flash-latest).")
 except Exception as e:
     add_log(f"❌ Gemini AI initialization failed: {e}")
@@ -133,7 +136,6 @@ class TradeDecision(BaseModel):
     trailing_stop_callback: float = Field(description="The trailing stop callback rate in percent (0.5-2.0).")
     order_pending_timeout_seconds: int = Field(description="Max time in seconds to wait for the limit order to fill (60-300).")
 
-# The Pydantic class itself is used as the schema definition
 TRADE_DECISION_SCHEMA = TradeDecision
 
 # --- 5. Data Acquisition and Analysis Functions ---
@@ -142,7 +144,6 @@ def get_klines_robust(symbol, interval, limit=200, retries=3, delay=5):
     """Robust K-line fetching with retry logic."""
     for i in range(retries):
         try:
-            # All futures methods must be prefixed with 'futures_'
             klines = binance_client.futures_klines(symbol=symbol, interval=interval, limit=limit)
             columns = ['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore']
             df = pd.DataFrame(klines, columns=columns)
@@ -167,13 +168,13 @@ def get_market_vitals(symbol):
         total_qty = total_bids_qty + total_asks_qty
         vitals['order_book_imbalance'] = total_bids_qty / total_qty if total_qty > 0 else 0.5
         
-        premium_index = binance_client.futures_premium_index(symbol=symbol)
+        premium_index = binance_client.futures_premium_index(symbol=symbol) # type: ignore
         vitals['funding_rate'] = float(premium_index['lastFundingRate'])
         
         open_interest_hist = binance_client.futures_open_interest_hist(symbol=symbol, period='5m', limit=1)
         vitals['open_interest'] = float(open_interest_hist[0]['sumOpenInterestValue'])
         
-        long_short_ratio = binance_client.futures_top_long_short_account_ratio(symbol=symbol, period='5m', limit=1)[0]
+        long_short_ratio = binance_client.futures_top_long_short_account_ratio(symbol=symbol, period='5m', limit=1)[0] # type: ignore
         vitals['top_trader_long_short_ratio'] = float(long_short_ratio['longShortRatio'])
         return vitals
     except BinanceAPIException as e:
@@ -224,26 +225,19 @@ def get_gemini_decision(analysis_data):
     add_log("🧠 Requesting Gemini strategy...")
     
     system_instruction = (
-        "You are an AI quantitative trading strategist. Before making a decision, "
-        "you must internally synthesize the Market Vitals and K-line data to form a clear thesis. "
-        "Your final output MUST be a single JSON object conforming to the provided schema. "
-        "Dynamically set risk parameters (leverage, trailing_stop_callback, risk_per_trade_percent) "
-        "based on the confidence derived from the data synthesis."
+        "You are an AI quantitative trading strategist. Your final output MUST be a single JSON object conforming to the provided schema. "
+        "Dynamically set risk parameters based on the confidence derived from the data synthesis."
     )
 
     prompt = f"""
     Analyze the following comprehensive market data for {config.SYMBOL}.
     Synthesize all layers of data (Vitals and K-lines) to determine the highest probability trade.
-
     Here is the full data bundle:
     {analysis_data}
-
     Return the JSON object now.
     """
     
     try:
-        # Gemini configuration for deterministic, structured output
-        # 'thinking_mode' is not a direct API parameter but is emulated by the system instruction.
         response = gemini_model.generate_content(
             prompt,
             generation_config=types.GenerationConfig(
@@ -260,6 +254,24 @@ def get_gemini_decision(analysis_data):
         return None
 
 # --- 6. Trading Execution and Management Functions ---
+
+def get_current_position():
+    """Checks current position via Binance API."""
+    try:
+        positions = binance_client.futures_position_information()
+        for p in positions:
+            if p['symbol'] == config.SYMBOL:
+                pos_amt = float(p['positionAmt'])
+                if pos_amt != 0:
+                    return {
+                        "side": "LONG" if pos_amt > 0 else "SHORT",
+                        "quantity": abs(pos_amt),
+                        "entry_price": float(p['entryPrice'])
+                    }
+        return {"side": None, "quantity": 0, "entry_price": 0}
+    except BinanceAPIException as e:
+        add_log(f"Error checking position: {e}")
+        return {"side": None, "quantity": 0, "entry_price": 0}
 
 def check_for_trigger(df):
     """Dynamic check for market anomalies based on alert level."""
@@ -406,16 +418,21 @@ def main_loop():
         try:
             bot_status['bot_state'] = current_bot_state.name
             
-            # PNL and Position Update
             pos = get_current_position()
             if pos['side']:
-                # ... (PNL Calculation logic) ...
                 bot_status['position'] = pos
+                ticker = binance_client.futures_mark_price(symbol=config.SYMBOL)
+                current_price = float(ticker['markPrice'])
+                pnl_usd = (current_price - pos['entry_price']) * pos['quantity'] if pos['side'] == 'LONG' else (pos['entry_price'] - current_price) * pos['quantity']
+                
+                leverage = last_gemini_decision.get('leverage', 20)
+                initial_margin = (pos['entry_price'] * pos['quantity']) / leverage if leverage > 0 else 0
+                pnl_perc = (pnl_usd / initial_margin) * 100 if initial_margin > 0 else 0
+                bot_status['pnl'] = {"usd": pnl_usd, "percentage": pnl_perc}
             else:
                 bot_status['position'] = {"side": None, "quantity": 0, "entry_price": 0}
                 bot_status['pnl'] = {"usd": None, "percentage": 0}
             
-            # --- State Machine Logic ---
             if current_bot_state == BotState.SEARCHING:
                 trigger_df = get_klines_robust(config.SYMBOL, '1m', limit=21)
                 is_triggered, reason, vol_ratio, rng_ratio = check_for_trigger(trigger_df)
@@ -433,6 +450,7 @@ def main_loop():
                     trade_decision = get_gemini_decision(analysis_bundle)
                     if trade_decision:
                         bot_status['last_gemini_decision'] = trade_decision
+                        last_gemini_decision = trade_decision
                         execute_trade(trade_decision)
                 else:
                     add_log("Analysis failed, returning to SEARCHING.")

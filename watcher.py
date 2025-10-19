@@ -4,13 +4,13 @@ import asyncio
 from binance import AsyncClient, BinanceSocketManager
 import requests
 import time
-import config_template
+import config
 
 # --- Telegram Notification Function ---
 def send_telegram_notification(message):
     """Sends a formatted message to your Telegram."""
-    bot_token = config_template.TELEGRAM_BOT_TOKEN
-    chat_id = config_template.TELEGRAM_CHAT_ID
+    bot_token = config.TELEGRAM_BOT_TOKEN
+    chat_id = config.TELEGRAM_CHAT_ID
     
     # Using a code block in Telegram for clean formatting
     formatted_message = f"```\n{message}\n```"
@@ -57,7 +57,9 @@ async def process_message(msg):
             trade_qty = order_data.get('l')
             total_cost = float(order_data.get('n', 0))
             
-            action = "✅ Position Opened/Increased" if order_status in ['PARTIALLY_FILLED', 'FILLED'] else "💰 Position Closed/Reduced"
+            action = "✅ Position Opened/Increased"
+            if order_status == 'FILLED' and order_data.get('R') == True: # ReduceOnly flag
+                action = "💰 Position Closed/Reduced"
             
             message = (
                 f"{action} ✅\n\n"
@@ -78,7 +80,7 @@ async def main():
     print("="*40)
     print("Listening for all account activity in real-time...")
     
-    client = await AsyncClient.create(config_template.BINANCE_API_KEY, config_template.BINANCE_API_SECRET, testnet=config_template.BINANCE_TESTNET)
+    client = await AsyncClient.create(config.BINANCE_API_KEY, config.BINANCE_API_SECRET, testnet=config.BINANCE_TESTNET)
     bm = BinanceSocketManager(client)
     
     user_socket = bm.user_socket()
