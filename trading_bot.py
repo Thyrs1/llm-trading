@@ -102,35 +102,39 @@ except Exception as e:
 # --- 4. Gemini Pydantic Schema and Master Prompt ---
 # trading_bot.py (TradeDecision class - Corrected)
 
-class TradeDecision(BaseModel):
-    """Defines the complete action plan for the bot, as decided by the AI."""
-    
-    action: str = Field(description="The immediate action to take: 'OPEN_POSITION', 'CLOSE_POSITION', 'MODIFY_POSITION', or 'WAIT'.")
-    
-    # --- Section for OPEN_POSITION ---
-    # CRITICAL FIX: Remove the 'None' default value from the Field function.
-    # The 'Optional' type hint is enough to mark it as not always required.
-    decision: Optional[str] = Field(description="Required if action is 'OPEN_POSITION'. The direction: 'LONG' or 'SHORT'.")
-    confidence: Optional[str] = Field(description="Required if action is 'OPEN_POSITION'. Confidence: 'high', 'medium', 'low'.")
-    entry_price: Optional[float] = Field(description="Required if action is 'OPEN_POSITION'. Target entry price.")
-    stop_loss: Optional[float] = Field(description="Required if action is 'OPEN_POSITION' or 'MODIFY_POSITION'. Mandatory stop loss.")
-    take_profit: Optional[float] = Field(description="Required if action is 'OPEN_POSITION' or 'MODIFY_POSITION'. Initial take profit.")
-    leverage: Optional[int] = Field(description="Required if action is 'OPEN_POSITION'. Leverage an int from 1 - 125.")
-    risk_per_trade_percent: Optional[float] = Field(description="Required if action is 'OPEN_POSITION'. Capital risk percentage an int from 1 to 100 (max 30 allowed).")
-    
-    # --- Section for MODIFY_POSITION ---
-    new_stop_loss: Optional[float] = Field(description="Required if action is 'MODIFY_POSITION'. The new stop loss price.")
-    new_take_profit: Optional[float] = Field(description="Required if action is 'MODIFY_POSITION'. The new take profit price.")
 
-    # --- Section for WAIT ---
-    next_analysis_trigger: str = Field(description="Condition for next analysis: 'IMMEDIATE' (loop), or 'PRICE_CROSS'.")
-    trigger_price: Optional[float] = Field(description="Required if next_analysis_trigger is 'PRICE_CROSS'. The price to watch.")
-    trigger_direction: Optional[str] = Field(description="Required if next_analysis_trigger is 'PRICE_CROSS'. Direction: 'ABOVE' or 'BELOW'.")
-    trigger_timeout: Optional[str] = Field(description="Required if next_analysis_trigger is 'PRICE_CROSS'. Maximum wait time in seconds before re-analysis, e.g., '300' for 5 minutes.")
+class InitialAction(BaseModel):
+    """Step 1: AI decides the type of action to take."""
+    action: str = Field(description="The high-level action to take: 'OPEN_POSITION', 'CLOSE_POSITION', 'MODIFY_POSITION', or 'WAIT'.")
+    reasoning: str = Field(description="Brief reasoning for this high-level action.")
+
+class OpenPositionParams(BaseModel):
+    """Step 2: AI provides specific parameters for opening a position."""
+    decision: str = Field(description="The direction: 'LONG' or 'SHORT'. Set to 'NULL' to abort.")
+    confidence: str = Field(description="Confidence: 'high', 'medium', or 'low'. Set to 'NULL' to abort.")
     
-    # --- Universal Field ---
-    reasoning: str = Field(description="Brief, disciplined reasoning for the chosen action.")
-TRADE_DECISION_SCHEMA = TradeDecision
+    # --- PRECISION INSTRUCTION ADDED ---
+    entry_price: float = Field(description="Target entry price (format: '%.2f'). Set to 0 to abort.")
+    stop_loss: float = Field(description="Mandatory stop loss (format: '%.2f'). Set to 0 to abort.")
+    take_profit: float = Field(description="Initial take profit (format: '%.2f'). Set to 0 to abort.")
+    
+    leverage: int = Field(description="Leverage (10-30). Set to 0 to abort.")
+    risk_per_trade_percent: float = Field(description="Capital risk percentage (15-30). Set to 0 to abort.")
+
+class ModifyPositionParams(BaseModel):
+    """Step 2: AI provides specific parameters for modifying a position."""
+    # --- PRECISION INSTRUCTION ADDED ---
+    new_stop_loss: float = Field(description="The new stop loss price (format: '%.2f'). Set to 0 to abort or if unchanged.")
+    new_take_profit: float = Field(description="The new take profit price (format: '%.2f'). Set to 0 to abort or if unchanged.")
+
+class WaitParams(BaseModel):
+    """Step 2: AI provides specific parameters for waiting."""
+    next_analysis_trigger: str = Field(description="Condition for next analysis: 'IMMEDIATE' or 'PRICE_CROSS'.")
+    
+    # --- PRECISION INSTRUCTION ADDED ---
+    trigger_price: float = Field(description="Required if trigger is 'PRICE_CROSS' (format: '%.2f'). Set to 0 otherwise.")
+    trigger_timeout: int = Field(description="Required if trigger is 'PRICE_CROSS' Time in seconds to wait for the trigger condition before re-analyzing.")
+    trigger_direction: str = Field(description="Required if trigger is 'PRICE_CROSS': 'ABOVE' or 'BELOW'. Set to 'NULL' otherwise.")
 
 # --- MASTER PROMPT FOR MEMORY REFRESH ---
 GEMINI_SYSTEM_PROMPT = """
@@ -227,12 +231,21 @@ def run_heavy_analysis():
 
 # --- 6. Gemini Decision Function ---
 def get_gemini_decision(analysis_data, position_data):
+    """
+    Performs a two-step confirmation to get a robust, structured trading decision from Gemini.
+    """
     global current_key_index
-    add_log("🧠 Requesting strategic decision from Gemini...")
+    add_log("🧠 Step 1: Requesting initial action from Gemini...")
     
-    # Construct the full prompt with the master instructions for memory refresh
-    prompt = f"""
-    {GEMINI_SYSTEM_PROMPT}
+    # --- STEP 1: Get the high-level action ---
+    
+    system_instruction_step1 = (
+        "You are 'The Scalpel', the world's top proprietary trader. Your task is to first decide the high-level action to take: "
+        "'OPEN_POSITION', 'CLOSE_POSITION', 'MODIFY_POSITION', or 'WAIT'. Your output MUST be a single JSON object conforming to the InitialAction schema."
+    )
+    prompt_step1 = f"""
+    **DIRECTIVE (Step 1/2): Determine High-Level Action**
+    Analyze the following data and decide on the general course of action.
 
     **1. Current Position Status:**
     {position_data}
@@ -240,7 +253,72 @@ def get_gemini_decision(analysis_data, position_data):
     **2. Holographic Market Analysis:**
     {analysis_data}
 
-    Return the JSON object now.
+    Return the InitialAction JSON object now.
+    """
+    
+    initial_decision = None
+    for i in range(len(config.GEMINI_API_KEYS)):
+        try:
+            key = config.GEMINI_API_KEYS[current_key_index]
+            genai.configure(api_key=key) # type: ignore
+            current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
+            
+            response = gemini_model.generate_content(
+                prompt_step1,
+                generation_config=types.GenerationConfig(
+                    response_mime_type="application/json",
+                    response_schema=InitialAction,
+                    temperature=0,
+                )
+            )
+            initial_decision = json.loads(response.text)
+            add_log(f"✅ Gemini Step 1 successful. Action: {initial_decision.get('action')}")
+            break # Success, exit the loop
+        except exceptions.ResourceExhausted:
+            add_log(f"⚠️ Gemini API key at index {current_key_index-1} is rate-limited. Switching...")
+            continue
+        except Exception as e:
+            add_log(f"❌ Error during Gemini Step 1: {e}")
+            return None
+            
+    if not initial_decision:
+        add_log("🚨 All Gemini API keys failed for Step 1. Pausing.")
+        time.sleep(60)
+        return None
+
+    # --- STEP 2: Get the specific parameters for the chosen action ---
+    
+    action = initial_decision.get('action')
+    if not action:
+        add_log("❌ Gemini Step 1 returned no action. Aborting.")
+        return None
+
+    add_log(f"🧠 Step 2: Requesting parameters for action '{action}'...")
+    
+    schema_map = {
+        'OPEN_POSITION': OpenPositionParams,
+        'MODIFY_POSITION': ModifyPositionParams,
+        'WAIT': WaitParams,
+    }
+    
+    # For CLOSE_POSITION, we don't need more parameters.
+    if action == 'CLOSE_POSITION':
+        return initial_decision
+
+    target_schema = schema_map.get(action)
+    if not target_schema:
+        add_log(f"Unknown action '{action}' from Step 1. Aborting.")
+        return initial_decision # Return the partial decision
+
+    prompt_step2 = f"""
+    **DIRECTIVE (Step 2/2): Provide Specific Parameters**
+    Your initial decision was '{action}' with the reasoning: "{initial_decision.get('reasoning')}"
+
+    Now, provide the exact parameters for this action.
+    - If the opportunity is still valid, fill all fields in the schema.
+    - **If the opportunity has passed or is no longer valid, you can abort by setting numerical values to 0 and string values to 'NULL'.**
+
+    Return the {target_schema.__name__} JSON object now.
     """
     
     for i in range(len(config.GEMINI_API_KEYS)):
@@ -250,25 +328,29 @@ def get_gemini_decision(analysis_data, position_data):
             current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
             
             response = gemini_model.generate_content(
-                prompt,
+                prompt_step2,
                 generation_config=types.GenerationConfig(
                     response_mime_type="application/json",
-                    response_schema=TRADE_DECISION_SCHEMA,
+                    response_schema=target_schema,
                     temperature=0,
                 )
             )
             
-            decision = json.loads(response.text)
-            add_log("✅ Gemini decision received successfully.")
-            return decision
-        except exceptions.ResourceExhausted as e:
+            params = json.loads(response.text)
+            add_log(f"✅ Gemini Step 2 successful.")
+            
+            # Combine the results from both steps into one final decision object
+            final_decision = {**initial_decision, **params}
+            return final_decision
+            
+        except exceptions.ResourceExhausted:
             add_log(f"⚠️ Gemini API key at index {current_key_index-1} is rate-limited. Switching...")
             continue
         except Exception as e:
-            add_log(f"❌ An unexpected error occurred during Gemini API call: {e}")
+            add_log(f"❌ Error during Gemini Step 2: {e}")
             return None
-            
-    add_log("🚨 All Gemini API keys are rate-limited. Pausing for 60 seconds...")
+
+    add_log("🚨 All Gemini API keys failed for Step 2. Pausing.")
     time.sleep(60)
     return None
 
