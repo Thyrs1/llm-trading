@@ -1,4 +1,4 @@
-<!-- templates/index.html -->
+<!-- templates/index.html (v2 - AI-Driven Dashboard) -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6,33 +6,42 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Gemini Trading Bot Dashboard</title>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 20px; }
-        .container { max-width: 1200px; margin: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        .card { background-color: #1e1e1e; border-radius: 8px; padding: 20px; border: 1px solid #2a2a2a; }
-        h2 { color: #bb86fc; border-bottom: 2px solid #373737; padding-bottom: 10px; margin-top: 0; font-weight: 500;}
+        :root {
+            --bg-color: #121212; --card-bg: #1e1e1e; --text-color: #e0e0e0;
+            --primary-color: #bb86fc; --secondary-color: #03dac6; --error-color: #cf6679;
+            --border-color: #2a2a2a; --subtle-text: #888;
+        }
+        body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif; background-color: var(--bg-color); color: var(--text-color); margin: 0; padding: 20px; }
+        .container { max-width: 1400px; margin: auto; display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; }
+        .card { background-color: var(--card-bg); border-radius: 8px; padding: 20px; border: 1px solid var(--border-color); }
+        h2 { color: var(--primary-color); border-bottom: 2px solid #373737; padding-bottom: 10px; margin-top: 0; font-weight: 500; font-size: 1.2em; }
         .status-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; }
         .status-item { display: flex; flex-direction: column; }
-        .status-item span:first-child { font-size: 0.8em; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+        .status-item span:first-child { font-size: 0.8em; color: var(--subtle-text); text-transform: uppercase; letter-spacing: 0.5px; }
         .status-item span:last-child { font-size: 1.4em; font-weight: bold; }
-        #pnl.positive { color: #03dac6; }
-        #pnl.negative { color: #cf6679; }
+        #pnl.positive { color: var(--secondary-color); }
+        #pnl.negative { color: var(--error-color); }
         #bot-state { padding: 5px 10px; border-radius: 20px; display: inline-block; font-size: 1.1em !important; font-weight: 500 !important;}
-        .state-SEARCHING { background-color: #2a3d45; color: #87c1de;}
+        .state-SEARCHING, .state-INITIALIZING { background-color: #2a3d45; color: #87c1de;}
         .state-ANALYZING { background-color: #fca311; color: #121212; }
         .state-ORDER_PENDING { background-color: #14213d; color: #e0e0e0;}
-        .state-IN_POSITION { background-color: #03dac6; color: #121212; }
+        .state-IN_POSITION { background-color: var(--secondary-color); color: #121212; }
         .state-COOL_DOWN { background-color: #6d6875; color: #e0e0e0;}
         pre { background-color: #2c2c2c; padding: 15px; border-radius: 5px; white-space: pre-wrap; word-wrap: break-word; font-family: 'SF Mono', 'Courier New', monospace; font-size: 0.9em; line-height: 1.6;}
         ul { list-style: none; padding: 0; max-height: 400px; overflow-y: auto; }
-        li { background-color: #2c2c2c; padding: 8px 12px; border-radius: 4px; margin-bottom: 5px; font-size: 0.9em; font-family: 'SF Mono', 'Courier New', monospace; border-left: 3px solid #bb86fc;}
+        li { background-color: #2c2c2c; padding: 8px 12px; border-radius: 4px; margin-bottom: 5px; font-size: 0.9em; font-family: 'SF Mono', 'Courier New', monospace; border-left: 3px solid var(--primary-color);}
         .grid-col-span-2 { grid-column: span 2; }
-        .spinner { border: 2px solid #f3f3f3; border-top: 2px solid #bb86fc; border-radius: 50%; width: 12px; height: 12px; animation: spin 1s linear infinite; display: inline-block; margin-right: 8px;}
+        .grid-col-span-4 { grid-column: span 4; }
+        .spinner { border: 2px solid #f3f3f3; border-top: 2px solid var(--primary-color); border-radius: 50%; width: 12px; height: 12px; animation: spin 1s linear infinite; display: inline-block; margin-right: 8px;}
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .action-plan-details { margin-top: 10px; font-family: 'SF Mono', 'Courier New', monospace; }
+        .action-plan-details div { margin-bottom: 5px; }
+        .action-plan-details .label { color: var(--subtle-text); display: inline-block; width: 100px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="card">
+        <div class="card grid-col-span-2">
             <h2>Bot Status</h2>
             <div class="status-grid">
                 <div class="status-item"><span>Current State</span><span id="bot-state">--</span></div>
@@ -41,7 +50,8 @@
                 <div class="status-item"><span>Uptime</span><span id="uptime">--</span></div>
             </div>
         </div>
-        <div class="card">
+
+        <div class="card grid-col-span-2">
             <h2>Live Position</h2>
             <div class="status-grid">
                 <div class="status-item"><span>Direction</span><span id="pos-side">--</span></div>
@@ -50,26 +60,103 @@
                 <div class="status-item"><span>Unrealized PNL</span><span id="pnl">--</span></div>
             </div>
         </div>
+
         <div class="card grid-col-span-2">
-            <h2>Last Gemini Decision</h2>
-            <pre id="gemini-output">Awaiting first analysis...</pre>
+            <h2>💡 Gemini's Action Plan</h2>
+            <div class="status-item">
+                <span>Current Action</span>
+                <span id="action" style="font-size: 2em; color: var(--secondary-color);">--</span>
+            </div>
+            <div id="action-details-container" style="margin-top: 15px;">
+                <!-- This will be populated by JavaScript -->
+            </div>
         </div>
+
         <div class="card grid-col-span-2">
+            <h2>🧠 Gemini's Reasoning</h2>
+            <pre id="reasoning">Awaiting first analysis...</pre>
+        </div>
+
+        <div class="card grid-col-span-4">
             <h2>Activity Log</h2>
             <ul id="activity-log">
                 <li>Waiting for bot to start...</li>
             </ul>
         </div>
     </div>
+
     <script>
         const botStartTime = Date.now();
-        function formatNumber(num, digits = 4) { return num ? parseFloat(num).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: digits }) : '--'; }
-        function updateUptime() { const uptimeSeconds = Math.floor((Date.now() - botStartTime) / 1000); const d = Math.floor(uptimeSeconds / 86400); const h = Math.floor(uptimeSeconds % 86400 / 3600); const m = Math.floor(uptimeSeconds % 3600 / 60); const s = Math.floor(uptimeSeconds % 60); document.getElementById('uptime').textContent = `${d}d ${h}h ${m}m ${s}s`; }
+
+        function formatNumber(num, digits = 4) {
+            return num ? parseFloat(num).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: digits }) : '--';
+        }
+
+        function updateUptime() {
+            const uptimeSeconds = Math.floor((Date.now() - botStartTime) / 1000);
+            const d = Math.floor(uptimeSeconds / 86400);
+            const h = Math.floor(uptimeSeconds % 86400 / 3600);
+            const m = Math.floor(uptimeSeconds % 3600 / 60);
+            const s = Math.floor(uptimeSeconds % 60);
+            document.getElementById('uptime').textContent = `${d}d ${h}h ${m}m ${s}s`;
+        }
+
+        function renderActionDetails(decision) {
+            const container = document.getElementById('action-details-container');
+            container.innerHTML = ''; // Clear previous details
+
+            if (!decision || !decision.action) {
+                container.innerHTML = '<span>No action plan available.</span>';
+                return;
+            }
+
+            const action = decision.action;
+            let detailsHtml = '';
+
+            if (action === 'WAIT') {
+                const trigger = decision.next_analysis_trigger;
+                if (trigger === 'PRICE_CROSS') {
+                    detailsHtml = `<div class="status-item">
+                                       <span>Trigger Condition</span>
+                                       <span style="font-size: 1.5em;">🎯 ${decision.trigger_direction} ${formatNumber(decision.trigger_price)}</span>
+                                   </div>`;
+                } else {
+                    detailsHtml = `<div class="status-item">
+                                       <span>Next Action</span>
+                                       <span style="font-size: 1.5em;">Continuous Monitoring</span>
+                                   </div>`;
+                }
+            } else if (action === 'OPEN_POSITION') {
+                detailsHtml = `
+                    <div class="action-plan-details">
+                        <div><span class="label">Direction:</span> <strong>${decision.decision}</strong></div>
+                        <div><span class="label">Confidence:</span> ${decision.confidence}</div>
+                        <div><span class="label">Entry:</span> ${formatNumber(decision.entry_price)}</div>
+                        <div><span class="label">Stop Loss:</span> ${formatNumber(decision.stop_loss)}</div>
+                        <div><span class="label">Take Profit:</span> ${formatNumber(decision.take_profit)}</div>
+                        <div><span class="label">Leverage:</span> ${decision.leverage}x</div>
+                        <div><span class="label">Risk:</span> ${decision.risk_per_trade_percent}%</div>
+                    </div>`;
+            } else if (action === 'MODIFY_POSITION') {
+                 detailsHtml = `
+                    <div class="action-plan-details">
+                        <div><span class="label">New SL:</span> ${formatNumber(decision.new_stop_loss) || 'Unchanged'}</div>
+                        <div><span class="label">New TP:</span> ${formatNumber(decision.new_take_profit) || 'Unchanged'}</div>
+                    </div>`;
+            } else if (action === 'CLOSE_POSITION') {
+                detailsHtml = `<div class="status-item"><span>Instruction</span><span style="font-size: 1.5em;">Close position at market.</span></div>`;
+            }
+
+            container.innerHTML = detailsHtml;
+        }
+
         async function fetchStatus() {
             try {
                 const response = await fetch('/status');
                 if (!response.ok) return;
                 const data = await response.json();
+
+                // Bot Status Card
                 const stateEl = document.getElementById('bot-state');
                 const stateText = data.bot_state || '--';
                 if (stateText === 'ANALYZING') {
@@ -80,21 +167,35 @@
                 stateEl.className = 'state-' + (data.bot_state || 'UNKNOWN');
                 document.getElementById('symbol').textContent = data.symbol || '--';
                 document.getElementById('last-update').textContent = data.last_update ? new Date(data.last_update).toLocaleTimeString() : '--';
+
+                // Position Card
                 document.getElementById('pos-side').textContent = data.position.side || 'FLAT';
                 document.getElementById('pos-entry').textContent = formatNumber(data.position.entry_price);
                 document.getElementById('pos-size').textContent = data.position.quantity ? `${data.position.quantity} ${data.symbol.replace('USDT','')}` : '--';
+                
                 const pnlEl = document.getElementById('pnl');
                 if (data.pnl && data.pnl.usd !== null) {
                     pnlEl.textContent = `${formatNumber(data.pnl.usd)} USDT (${data.pnl.percentage.toFixed(2)}%)`;
                     pnlEl.className = data.pnl.usd >= 0 ? 'positive' : 'negative';
                 } else { pnlEl.textContent = '--'; pnlEl.className = ''; }
-                document.getElementById('gemini-output').textContent = data.last_gemini_decision ? JSON.stringify(data.last_gemini_decision, null, 2) : 'Awaiting first analysis...';
+
+                // Gemini Cards
+                const decision = data.last_gemini_decision;
+                document.getElementById('action').textContent = decision ? decision.action : '--';
+                document.getElementById('reasoning').textContent = decision ? decision.reasoning : 'Awaiting first analysis...';
+                renderActionDetails(decision);
+
+                // Activity Log
                 const logEl = document.getElementById('activity-log');
                 logEl.innerHTML = '';
                 if (data.log && data.log.length > 0) { data.log.forEach(entry => { const li = document.createElement('li'); li.textContent = entry; logEl.appendChild(li); });
                 } else { logEl.innerHTML = '<li>No activity yet.</li>'; }
-            } catch (error) { console.error("Error fetching status:", error); }
+
+            } catch (error) {
+                console.error("Error fetching status:", error);
+            }
         }
+
         setInterval(fetchStatus, 3000);
         setInterval(updateUptime, 1000);
         document.addEventListener('DOMContentLoaded', fetchStatus);
