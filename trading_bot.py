@@ -42,7 +42,7 @@ pending_order_start_time = 0
 current_key_index = 0
 # --- NEW: Global variables for exchange precision rules ---
 price_precision = 2  # Default, will be updated on startup
-quantity_precision = 0 # Default, will be updated on startup
+quantity_precision = 2 # Default, will be updated on startup
 
 # --- 2. Utility Functions ---
 def save_status():
@@ -84,7 +84,7 @@ try:
     for s in exchange_info['symbols']:
         if s['symbol'] == config.SYMBOL:
             price_precision = 2
-            quantity_precision = 0
+            quantity_precision = 2
             add_log(f"✅ Precision rules for {config.SYMBOL}: Price={price_precision}, Quantity={quantity_precision}")
             break
 
@@ -229,15 +229,61 @@ def run_heavy_analysis():
         all_data_content += report
     return all_data_content
 
+def is_decision_sane(decision):
+    """
+    Performs a sanity check on the prices provided by Gemini to prevent hallucinations.
+    """
+    try:
+        # Get the current mark price for comparison
+        ticker = binance_client.futures_mark_price(symbol=config.SYMBOL)
+        current_price = float(ticker['markPrice'])
+        
+        # Define the acceptable price range (e.g., +/- 10% from current price)
+        max_price = current_price * (1 + config.PRICE_SANITY_CHECK_PERCENT)
+        min_price = current_price * (1 - config.PRICE_SANITY_CHECK_PERCENT)
+        
+        # Check all relevant prices from the decision
+        prices_to_check = [
+            decision.get('entry_price'),
+            decision.get('stop_loss'),
+            decision.get('take_profit'),
+            decision.get('new_stop_loss'),
+            decision.get('new_take_profit'),
+            decision.get('trigger_price')
+        ]
+        
+        for price in prices_to_check:
+            # Skip if the price is not provided or is 0
+            if price is None or price == 0:
+                continue
+            
+            # If any price is outside the sane range, the decision is invalid
+            if not (min_price <= price <= max_price):
+                add_log(f"🚨 SANITY CHECK FAILED: AI proposed price {price} is outside the acceptable range ({min_price:.2f} - {max_price:.2f}). Current price is {current_price:.2f}.")
+                return False
+                
+        add_log("✅ Sanity check passed. AI decision is within reasonable price limits.")
+        return True
+        
+    except BinanceAPIException as e:
+        add_log(f"❌ Error during sanity check while fetching mark price: {e}")
+        return False # Fail safe
+    except Exception as e:
+        add_log(f"❌ An unexpected error occurred during sanity check: {e}")
+        return False # Fail safe
+
 # --- 6. Gemini Decision Function ---
+# trading_bot.py (Corrected get_gemini_decision function)
+
 def get_gemini_decision(analysis_data, position_data):
     """
-    Performs a two-step confirmation to get a robust, structured trading decision from Gemini.
+    Performs a two-step, completely stateless confirmation to get a robust decision from Gemini.
+    A new model instance is created for each request to ensure no memory is carried over.
     """
     global current_key_index
-    add_log("🧠 Step 1: Requesting initial action from Gemini...")
     
     # --- STEP 1: Get the high-level action ---
+    add_log("🧠 Step 1: Requesting initial action from Gemini (Stateless)...")
     
     system_instruction_step1 = (
         "You are 'The Scalpel', the world's top proprietary trader. Your task is to first decide the high-level action to take: "
@@ -260,10 +306,16 @@ def get_gemini_decision(analysis_data, position_data):
     for i in range(len(config.GEMINI_API_KEYS)):
         try:
             key = config.GEMINI_API_KEYS[current_key_index]
+            add_log(f"Attempting Step 1 with key index {current_key_index}...")
+            
+            # --- STATELESS FIX: Create another new, fresh model instance for this request ---
             genai.configure(api_key=key) # type: ignore
+            model = genai.GenerativeModel('gemini-flash-latest') # type: ignore
+            
+            # Move to the next key for the subsequent call
             current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
             
-            response = gemini_model.generate_content(
+            response = model.generate_content(
                 prompt_step1,
                 generation_config=types.GenerationConfig(
                     response_mime_type="application/json",
@@ -289,11 +341,11 @@ def get_gemini_decision(analysis_data, position_data):
     # --- STEP 2: Get the specific parameters for the chosen action ---
     
     action = initial_decision.get('action')
-    if not action:
-        add_log("❌ Gemini Step 1 returned no action. Aborting.")
-        return None
+    if not action or action == 'CLOSE_POSITION':
+        # For CLOSE_POSITION, we don't need more parameters.
+        return initial_decision
 
-    add_log(f"🧠 Step 2: Requesting parameters for action '{action}'...")
+    add_log(f"🧠 Step 2: Requesting parameters for action '{action}' (Stateless)...")
     
     schema_map = {
         'OPEN_POSITION': OpenPositionParams,
@@ -301,10 +353,6 @@ def get_gemini_decision(analysis_data, position_data):
         'WAIT': WaitParams,
     }
     
-    # For CLOSE_POSITION, we don't need more parameters.
-    if action == 'CLOSE_POSITION':
-        return initial_decision
-
     target_schema = schema_map.get(action)
     if not target_schema:
         add_log(f"Unknown action '{action}' from Step 1. Aborting.")
@@ -324,10 +372,15 @@ def get_gemini_decision(analysis_data, position_data):
     for i in range(len(config.GEMINI_API_KEYS)):
         try:
             key = config.GEMINI_API_KEYS[current_key_index]
+            add_log(f"Attempting Step 2 with key index {current_key_index}...")
+
+            # --- STATELESS FIX: Create another new, fresh model instance for this request ---
             genai.configure(api_key=key) # type: ignore
+            model = genai.GenerativeModel('gemini-flash-latest') # type: ignore
+
             current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
             
-            response = gemini_model.generate_content(
+            response = model.generate_content(
                 prompt_step2,
                 generation_config=types.GenerationConfig(
                     response_mime_type="application/json",
@@ -382,34 +435,63 @@ def calculate_position_size(entry_price, stop_loss_price, risk_percent):
         return 0
 
 def open_position(decision):
-    global bot_status
+    """Executes the logic to open a new position with correct precision."""
+    global bot_status, last_gemini_decision
     bot_status['bot_state'] = "ORDER_PENDING"
+    
     side = decision.get('decision')
     entry_price = decision.get('entry_price')
     stop_loss_price = decision.get('stop_loss')
     leverage = decision.get('leverage')
     risk_percent = decision.get('risk_per_trade_percent')
+    
     if not all([side, entry_price, stop_loss_price, leverage, risk_percent]):
         add_log(f"❌ Gemini OPEN decision missing required fields. Decision: {decision}")
+        bot_status['bot_state'] = "SEARCHING"
         return
+
     try:
         binance_client.futures_change_leverage(symbol=config.SYMBOL, leverage=leverage)
         add_log(f"⚙️ Leverage set to {leverage}x.")
     except BinanceAPIException as e:
         add_log(f"❌ Failed to set leverage: {e}")
+        bot_status['bot_state'] = "SEARCHING"
         return
+
     position_size = calculate_position_size(entry_price, stop_loss_price, risk_percent)
     if position_size <= 0:
         add_log("Calculated position size is zero, trade cancelled.")
+        bot_status['bot_state'] = "SEARCHING"
         return
+        
     add_log(f"💎 Decision: {side} | Size: {position_size} | Risk: {risk_percent}%")
+    
     try:
-        order = binance_client.futures_create_order(symbol=config.SYMBOL, side='BUY' if side == 'LONG' else 'SELL', type='LIMIT', timeInForce='GTC', price=f"{entry_price:.2f}", quantity=position_size, newOrderRespType='RESULT', isMakers=True)
-        add_log(f"✅ Post-Only Limit Order placed @ {entry_price:.2f} (ID: {order['orderId']})")
+        # --- RE-INTRODUCED PYTHON FORMATTING ---
+        formatted_price = f"{entry_price:.{price_precision}f}"
+        formatted_quantity = f"{position_size:.{quantity_precision}f}"
+        
+        add_log(f"Formatted Order: Price={formatted_price}, Qty={formatted_quantity}")
+
+        order = binance_client.futures_create_order(
+            symbol=config.SYMBOL,
+            side='BUY' if side == 'LONG' else 'SELL',
+            type='LIMIT',
+            timeInForce='GTC',
+            price=formatted_price,
+            quantity=formatted_quantity,
+            newOrderRespType='RESULT',
+            isMakers=True
+        )
+        add_log(f"✅ Post-Only Limit Order placed @ {formatted_price} (ID: {order['orderId']})")
         # Logic to handle pending order and SL/TP placement would go here
+        
     except BinanceAPIException as e:
-        if e.code == -2021: add_log("⚠️ Order failed: Price would execute immediately (Taker).")
-        else: add_log(f"❌ Binance order failed: {e}")
+        if e.code == -2021: 
+            add_log("⚠️ Order failed: Price would execute immediately (Taker).")
+        else: 
+            add_log(f"❌ Binance order failed: {e}")
+        bot_status['bot_state'] = "SEARCHING"
 
 def close_position(position):
     add_log(f"Executing Gemini's instruction to CLOSE position...")
@@ -422,45 +504,73 @@ def close_position(position):
         add_log(f"❌ Failed to close position: {e}")
 
 def modify_position(decision, position):
+    """Modifies the Stop Loss and/or Take Profit with correct precision."""
     add_log(f"Executing Gemini's instruction to MODIFY position...")
     try:
         binance_client.futures_cancel_all_open_orders(symbol=config.SYMBOL)
         sl_price = decision.get('new_stop_loss')
         tp_price = decision.get('new_take_profit')
         side = position['side']
-        if sl_price:
+        
+        if sl_price and sl_price > 0:
+            # --- RE-INTRODUCED PYTHON FORMATTING ---
+            formatted_sl = f"{sl_price:.{price_precision}f}"
             sl_side = 'SELL' if side == 'LONG' else 'BUY'
-            binance_client.futures_create_order(symbol=config.SYMBOL, side=sl_side, type='STOP_MARKET', stopPrice=f"{sl_price:.2f}", closePosition=True)
-            add_log(f"✅ New Stop Loss set @ {sl_price:.2f}")
-        if tp_price:
+            binance_client.futures_create_order(
+                symbol=config.SYMBOL, side=sl_side, type='STOP_MARKET',
+                stopPrice=formatted_sl, closePosition=True
+            )
+            add_log(f"✅ New Stop Loss set @ {formatted_sl}")
+            
+        if tp_price and tp_price > 0:
+            # --- RE-INTRODUCED PYTHON FORMATTING ---
+            formatted_tp = f"{tp_price:.{price_precision}f}"
             tp_side = 'SELL' if side == 'LONG' else 'BUY'
-            binance_client.futures_create_order(symbol=config.SYMBOL, side=tp_side, type='TAKE_PROFIT_MARKET', stopPrice=f"{tp_price:.2f}", closePosition=True)
-            add_log(f"✅ New Take Profit set @ {tp_price:.2f}")
+            binance_client.futures_create_order(
+                symbol=config.SYMBOL, side=tp_side, type='TAKE_PROFIT_MARKET',
+                stopPrice=formatted_tp, closePosition=True
+            )
+            add_log(f"✅ New Take Profit set @ {formatted_tp}")
+            
     except BinanceAPIException as e:
         add_log(f"❌ Failed to modify position: {e}")
 
 def wait_for_trigger(decision):
+    """Enters a fast loop to check for a specific condition set by Gemini."""
     trigger_type = decision.get('next_analysis_trigger')
     price = decision.get('trigger_price')
     direction = decision.get('trigger_direction')
-    trigger_timeout = decision.get('trigger_timeout')
-    add_log(f"Entering fast-check mode. WAITING for price to cross {direction} {price} in {trigger_timeout} seconds...")
-    timeout = time.time() + trigger_timeout
+    
+    # Add a check for valid trigger parameters
+    if not all([trigger_type, price, direction]) or price == 0 or direction == 'NULL':
+        add_log("⚠️ Gemini WAIT decision missing valid trigger parameters. Re-analyzing immediately.")
+        return
+
+    add_log(f"Entering fast-check mode. WAITING for price to cross {direction} {price}...")
+    
+    # Use the timeout from the AI's decision, with a default
+    timeout_seconds = decision.get('trigger_timeout', 300)
+    timeout = time.time() + timeout_seconds
+    
     while time.time() < timeout:
         try:
             ticker = binance_client.futures_mark_price(symbol=config.SYMBOL)
             current_price = float(ticker['markPrice'])
+            
             if direction == 'ABOVE' and current_price > price:
-                add_log(f"🎯 Trigger condition MET: Price {current_price} crossed ABOVE {price}.")
+                add_log(f"🎯 Trigger condition MET: Price {current_price:.4f} crossed ABOVE {price:.4f}.")
                 return
             if direction == 'BELOW' and current_price < price:
-                add_log(f"🎯 Trigger condition MET: Price {current_price} crossed BELOW {price}.")
+                add_log(f"🎯 Trigger condition MET: Price {current_price:.4f} crossed BELOW {price:.4f}.")
                 return
+                
+            # Check every 5 seconds
             time.sleep(5)
         except Exception as e:
             add_log(f"Error in wait_for_trigger loop: {e}")
-            time.sleep(15)
-    add_log("⏳ Wait condition timed out after {trigger_timeout} seconds}. Re-analyzing.")
+            time.sleep(15) # Wait longer on error
+            
+    add_log(f"⏳ Wait condition timed out after {timeout_seconds} seconds. Re-analyzing.")
 
 # --- 8. Main Loop ---
 def main_loop():
@@ -492,6 +602,14 @@ def main_loop():
             
             bot_status['last_gemini_decision'] = decision
             last_gemini_decision = decision
+            
+            # --- NEW: Perform Sanity Check BEFORE processing the action ---
+            if not is_decision_sane(decision):
+                add_log("Aborting action due to failed sanity check. Re-analyzing in next cycle.")
+                time.sleep(60) # Wait a minute before trying again
+                continue
+            # --- END NEW ---
+            
             add_log(f"💡 Gemini Action Plan: {decision.get('action')}. Reason: {decision.get('reasoning')}")
             action = decision.get('action')
             
