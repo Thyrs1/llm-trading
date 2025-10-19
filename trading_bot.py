@@ -126,6 +126,7 @@ class TradeDecision(BaseModel):
     next_analysis_trigger: str = Field(description="Condition for next analysis: 'IMMEDIATE' (loop), or 'PRICE_CROSS'.")
     trigger_price: Optional[float] = Field(description="Required if next_analysis_trigger is 'PRICE_CROSS'. The price to watch.")
     trigger_direction: Optional[str] = Field(description="Required if next_analysis_trigger is 'PRICE_CROSS'. Direction: 'ABOVE' or 'BELOW'.")
+    trigger_timeout: Optional[str] = Field(description="Required if next_analysis_trigger is 'PRICE_CROSS'. Maximum wait time in seconds before re-analysis, e.g., '300' for 5 minutes.")
     
     # --- Universal Field ---
     reasoning: str = Field(description="Brief, disciplined reasoning for the chosen action.")
@@ -360,8 +361,9 @@ def wait_for_trigger(decision):
     trigger_type = decision.get('next_analysis_trigger')
     price = decision.get('trigger_price')
     direction = decision.get('trigger_direction')
-    add_log(f"Entering fast-check mode. WAITING for price to cross {direction} {price}...")
-    timeout = time.time() + 3600
+    trigger_timeout = decision.get('trigger_timeout')
+    add_log(f"Entering fast-check mode. WAITING for price to cross {direction} {price} in {trigger_timeout} seconds...")
+    timeout = time.time() + trigger_timeout
     while time.time() < timeout:
         try:
             ticker = binance_client.futures_mark_price(symbol=config.SYMBOL)
@@ -376,7 +378,7 @@ def wait_for_trigger(decision):
         except Exception as e:
             add_log(f"Error in wait_for_trigger loop: {e}")
             time.sleep(15)
-    add_log("⏳ Wait condition timed out after 1 hour. Re-analyzing.")
+    add_log("⏳ Wait condition timed out after {trigger_timeout} seconds}. Re-analyzing.")
 
 # --- 8. Main Loop ---
 def main_loop():
