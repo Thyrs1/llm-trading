@@ -1,4 +1,4 @@
-# trading_bot.py
+# trading_bot.py (v6 - Fully Integrated and Structured)
 
 import os
 import time
@@ -12,8 +12,8 @@ import google.generativeai as genai
 from google.generativeai import types
 from enum import Enum
 from collections import deque
-from datetime import datetime
-import config_template
+from datetime import datetime, timezone
+import config
 
 # --- 1. State Management ---
 class BotState(Enum):
@@ -26,7 +26,7 @@ class BotState(Enum):
 # Global state dictionary for dashboard
 bot_status = {
     "bot_state": "INITIALIZING",
-    "symbol": config_template.SYMBOL,
+    "symbol": config.SYMBOL,
     "position": {"side": None, "quantity": 0, "entry_price": 0},
     "pnl": {"usd": None, "percentage": 0},
     "last_gemini_decision": None,
@@ -42,7 +42,8 @@ pending_order_start_time = 0
 
 def save_status():
     """Writes the global status dictionary to a JSON file for the dashboard."""
-    bot_status['last_update'] = datetime.utcnow().isoformat() + 'Z'
+    # FIX: Use timezone-aware datetime.now(timezone.utc)
+    bot_status['last_update'] = datetime.now(timezone.utc).isoformat()
     status_to_save = bot_status.copy()
     status_to_save['log'] = list(bot_status['log'])
     try:
@@ -61,16 +62,31 @@ def add_log(message):
 # --- 3. API Client Initialization ---
 
 try:
-    binance_client = Client(config_template.BINANCE_API_KEY, config_template.BINANCE_API_SECRET, testnet=config_template.BINANCE_TESTNET)
-    binance_client.futures_change_margin_type(symbol=config_template.SYMBOL, marginType='ISOLATED')
-    add_log(f"✅ Binance client initialized (Testnet: {config_template.BINANCE_TESTNET}).")
+    # 1. Initialize Binance Client
+    binance_client = Client(config.BINANCE_API_KEY, config.BINANCE_API_SECRET, testnet=config.BINANCE_TESTNET)
+    
+    # 2. Print Diagnostics and Test Connection
+    if config.BINANCE_TESTNET:
+        server_time = binance_client.get_server_time()
+        add_log(f"✅ Binance client initialized (TESTNET).")
+        add_log(f"   Server Time: {server_time['serverTime']}")
+    else:
+        add_log(f"✅ Binance client initialized (LIVE).")
+
+    # 3. Set Margin Type (ISOLATED)
+    binance_client.futures_change_margin_type(symbol=config.SYMBOL, marginType='ISOLATED')
+    add_log("✅ Margin type set to ISOLATED.")
+
+except BinanceAPIException as e:
+    add_log(f"❌ Binance initialization failed: APIError(code={e.code}): {e.message}")
+    exit()
 except Exception as e:
-    add_log(f"❌ Binance initialization failed: {e}")
+    add_log(f"❌ Unknown error during initialization: {e}")
     exit()
 
 try:
-    # Using gemini-2.5-flash-latest as requested
-    genai.configure(api_key=config_template.GOOGLE_API_KEY)
+    # Initialize Gemini Client
+    genai.configure(api_key=config.GOOGLE_API_KEY)
     gemini_model = genai.GenerativeModel('gemini-2.5-flash-latest')
     add_log("✅ Gemini AI client initialized (Flash).")
 except Exception as e:
@@ -138,18 +154,18 @@ def get_market_vitals(symbol):
 def run_heavy_analysis():
     """Generates the full holographic analysis report for Gemini."""
     add_log("🚀 Starting holographic analysis...")
-    market_vitals = get_market_vitals(config_template.SYMBOL)
+    market_vitals = get_market_vitals(config.SYMBOL)
     if not market_vitals: return None
         
     all_data_content = "### 1. Live Market Vitals\n"
     all_data_content += f"- Order Book Imbalance (Buy Pressure): {market_vitals['order_book_imbalance']:.2%}\n"
     all_data_content += f"- Funding Rate: {market_vitals['funding_rate']:.4%}\n"
-    all_data_content += f"- Open Interest: {market_vitals['open_interest']:,.0f} {config_template.SYMBOL}\n"
+    all_data_content += f"- Open Interest: {market_vitals['open_interest']:,.0f} {config.SYMBOL}\n"
     all_data_content += f"- Top Trader L/S Ratio: {market_vitals['top_trader_long_short_ratio']:.2f}\n\n"
     all_data_content += "### 2. Multi-Timeframe K-line Depth Analysis\n"
 
-    for tf in config_template.ANALYSIS_TIMEFRAMES:
-        df = get_klines_robust(config_template.SYMBOL, tf, limit=200)
+    for tf in config.ANALYSIS_TIMEFRAMES:
+        df = get_klines_robust(config.SYMBOL, tf, limit=200)
         if df is None: continue
         
         # Calculate indicators
@@ -188,7 +204,7 @@ def get_gemini_decision(analysis_data):
     )
 
     prompt = f"""
-    Analyze the following comprehensive market data for {config_template.SYMBOL}.
+    Analyze the following comprehensive market data for {config.SYMBOL}.
     Synthesize all layers of data (Vitals and K-lines) to determine the highest probability trade.
 
     Here is the full data bundle:
@@ -198,6 +214,7 @@ def get_gemini_decision(analysis_data):
     """
     
     try:
+        # Gemini configuration for deterministic, structured output
         response = gemini_model.generate_content(
             prompt,
             config=types.GenerateContentConfig(
@@ -208,7 +225,6 @@ def get_gemini_decision(analysis_data):
             )
         )
         
-        # The response text is guaranteed to be valid JSON due to structured output
         decision = json.loads(response.text)
         return decision
     except Exception as e:
@@ -222,7 +238,7 @@ def get_current_position():
     try:
         positions = binance_client.futures_position_information()
         for p in positions:
-            if p['symbol'] == config_template.SYMBOL:
+            if p['symbol'] == config.SYMBOL:
                 pos_amt = float(p['positionAmt'])
                 if pos_amt != 0:
                     return {
@@ -239,8 +255,8 @@ def check_for_trigger(df):
     """Dynamic check for market anomalies based on alert level."""
     if df is None or len(df) < 21: return False, "Data insufficient"
 
-    vol_mult = config_template.NORMAL_VOLUME_SPIKE if bot_status['bot_state'] == BotState.SEARCHING.name else config_template.ALERT_VOLUME_SPIKE
-    rng_mult = config_template.NORMAL_VOLATILITY_SPIKE if bot_status['bot_state'] == BotState.SEARCHING.name else config_template.ALERT_VOLATILITY_SPIKE
+    vol_mult = config.NORMAL_VOLUME_SPIKE if bot_status['bot_state'] == BotState.SEARCHING.name else config.ALERT_VOLUME_SPIKE
+    rng_mult = config.NORMAL_VOLATILITY_SPIKE if bot_status['bot_state'] == BotState.SEARCHING.name else config.ALERT_VOLATILITY_SPIKE
 
     last_20 = df.iloc[-21:-1]
     current = df.iloc[-1]
@@ -258,8 +274,8 @@ def check_for_trigger(df):
 def calculate_position_size(entry_price, stop_loss_price, risk_percent):
     """Calculates position size based on capital, risk, and stop distance."""
     try:
-        actual_risk_percent = min(risk_percent / 100, config_template.MAX_RISK_PER_TRADE)
-        amount_to_risk_usdt = config_template.TOTAL_CAPITAL_USDT * actual_risk_percent
+        actual_risk_percent = min(risk_percent / 100, config.MAX_RISK_PER_TRADE)
+        amount_to_risk_usdt = config.TOTAL_CAPITAL_USDT * actual_risk_percent
         
         price_delta_per_unit = abs(entry_price - stop_loss_price)
         if price_delta_per_unit == 0: return 0
@@ -287,7 +303,7 @@ def execute_trade(decision):
     
     # 1. Set dynamic leverage
     try:
-        binance_client.futures_change_leverage(symbol=config_template.SYMBOL, leverage=decision['leverage'])
+        binance_client.futures_change_leverage(symbol=config.SYMBOL, leverage=decision['leverage'])
         add_log(f"⚙️ Leverage set to {decision['leverage']}x.")
     except BinanceAPIException as e:
         add_log(f"❌ Failed to set leverage: {e}")
@@ -306,7 +322,7 @@ def execute_trade(decision):
     try:
         # 3. Place Post-Only Limit Order (Maker)
         order = binance_client.futures_create_order(
-            symbol=config_template.SYMBOL,
+            symbol=config.SYMBOL,
             side='BUY' if side == 'LONG' else 'SELL',
             type='LIMIT',
             timeInForce='GTC',
@@ -331,7 +347,6 @@ def manage_position(position):
     """Manages position, deploying Trailing Stop Loss near TP."""
     global last_gemini_decision
     
-    # Check if initial TP is set and if TSL has already been deployed (TP=0 means TSL is active)
     if last_gemini_decision.get('take_profit', 0) == 0:
         return # TSL already active
 
@@ -340,9 +355,8 @@ def manage_position(position):
     initial_tp = last_gemini_decision.get('take_profit')
     callback_rate = last_gemini_decision.get('trailing_stop_callback', 1.0) # Default 1.0%
     
-    # Get current price
     try:
-        ticker = binance_client.futures_mark_price(symbol=config_template.SYMBOL)
+        ticker = binance_client.futures_mark_price(symbol=config.SYMBOL)
         current_price = float(ticker['markPrice'])
     except BinanceAPIException:
         return
@@ -355,12 +369,12 @@ def manage_position(position):
         add_log(f"📈 Profit reached 75% of TP distance. Deploying Trailing Stop ({callback_rate}%)...")
         try:
             # 1. Cancel initial fixed TP/SL orders
-            binance_client.futures_cancel_all_open_orders(symbol=config_template.SYMBOL)
+            binance_client.futures_cancel_all_open_orders(symbol=config.SYMBOL)
 
             # 2. Set Trailing Stop Loss
             sl_side = 'SELL' if side == 'LONG' else 'BUY'
             binance_client.futures_create_order(
-                symbol=config_template.SYMBOL,
+                symbol=config.SYMBOL,
                 side=sl_side,
                 type='TRAILING_STOP_MARKET',
                 callbackRate=callback_rate,
@@ -391,11 +405,10 @@ def main_loop():
             pos = get_current_position()
             if pos['side']:
                 bot_status['position'] = pos
-                ticker = binance_client.futures_mark_price(symbol=config_template.SYMBOL)
+                ticker = binance_client.futures_mark_price(symbol=config.SYMBOL)
                 current_price = float(ticker['markPrice'])
                 pnl_usd = (current_price - pos['entry_price']) * pos['quantity'] if pos['side'] == 'LONG' else (pos['entry_price'] - current_price) * pos['quantity']
                 
-                # Use the leverage from the last decision, default to 20 if missing
                 leverage = last_gemini_decision.get('leverage', 20)
                 initial_margin = (pos['entry_price'] * pos['quantity']) / leverage
                 pnl_perc = (pnl_usd / initial_margin) * 100 if initial_margin > 0 else 0
@@ -407,7 +420,7 @@ def main_loop():
             # --- State Machine Logic ---
 
             if current_bot_state == BotState.SEARCHING:
-                trigger_df = get_klines_robust(config_template.SYMBOL, '1m', limit=21)
+                trigger_df = get_klines_robust(config.SYMBOL, '1m', limit=21)
                 is_triggered, reason = check_for_trigger(trigger_df)
                 if is_triggered:
                     add_log(f"🎯 Market Trigger Activated! Reason: {reason}")
@@ -427,7 +440,19 @@ def main_loop():
             
             elif current_bot_state == BotState.ORDER_PENDING:
                 # Check order status and timeout
-                # ... (Implementation details omitted for brevity) ...
+                try:
+                    order_status = binance_client.futures_get_order(symbol=config.SYMBOL, orderId=pending_order_id)
+                    if order_status['status'] == 'FILLED':
+                        add_log("🎉 Order FILLED! Entering IN_POSITION state.")
+                        # Place initial SL/TP orders here if TSL is not immediately active
+                        current_bot_state = BotState.IN_POSITION
+                    elif time.time() - pending_order_start_time > last_gemini_decision.get('order_pending_timeout_seconds', 300):
+                        binance_client.futures_cancel_order(symbol=config.SYMBOL, orderId=pending_order_id)
+                        add_log("⏳ Order timed out, cancelled. Returning to SEARCHING.")
+                        current_bot_state = BotState.SEARCHING
+                except BinanceAPIException as e:
+                    add_log(f"Querying order status failed: {e}")
+                    current_bot_state = BotState.SEARCHING
                 time.sleep(10)
 
             elif current_bot_state == BotState.IN_POSITION:
@@ -449,7 +474,7 @@ def main_loop():
         except KeyboardInterrupt:
             add_log("\nProgram manually stopped. Cancelling all open orders...")
             try:
-                binance_client.futures_cancel_all_open_orders(symbol=config_template.SYMBOL)
+                binance_client.futures_cancel_all_open_orders(symbol=config.SYMBOL)
                 add_log("All orders cancelled.")
             except BinanceAPIException as e:
                 add_log(f"Failed to cancel orders: {e}")
