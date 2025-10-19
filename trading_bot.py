@@ -1,4 +1,4 @@
-# trading_bot.py (v6 - Fully Integrated and Structured)
+# trading_bot.py
 
 import os
 import time
@@ -14,6 +14,7 @@ from enum import Enum
 from collections import deque
 from datetime import datetime, timezone
 import config
+from pydantic import BaseModel, Field
 
 # --- 1. State Management ---
 class BotState(Enum):
@@ -62,10 +63,19 @@ def add_log(message):
 # --- 3. API Client Initialization ---
 
 try:
-    # 1. Initialize Binance Client
-    binance_client = Client(config.BINANCE_API_KEY, config.BINANCE_API_SECRET, testnet=config.BINANCE_TESTNET)
+    # 1. Initialize Binance Client (without the problematic requests_params)
+    binance_client = Client(
+        config.BINANCE_API_KEY, 
+        config.BINANCE_API_SECRET, 
+        testnet=config.BINANCE_TESTNET
+    )
     
-    # 2. Print Diagnostics and Test Connection
+    # 2. Manually synchronize time (CRITICAL for -1021 error)
+    # This forces the client to calculate the time difference (offset) with the server.
+    binance_client.timestamp_offset = binance_client.get_server_time()['serverTime'] - int(time.time() * 1000)
+    add_log("✅ Time synchronization successful.")
+
+    # 3. Print Diagnostics and Test Connection
     if config.BINANCE_TESTNET:
         server_time = binance_client.get_server_time()
         add_log(f"✅ Binance client initialized (TESTNET).")
@@ -73,9 +83,19 @@ try:
     else:
         add_log(f"✅ Binance client initialized (LIVE).")
 
-    # 3. Set Margin Type (ISOLATED)
-    binance_client.futures_change_margin_type(symbol=config.SYMBOL, marginType='ISOLATED')
-    add_log("✅ Margin type set to ISOLATED.")
+    # 4. Set Margin Type (ISOLATED) and initial Leverage
+    try:
+        binance_client.futures_change_margin_type(symbol=config.SYMBOL, marginType='ISOLATED')
+        add_log("✅ Margin type set to ISOLATED.")
+    except BinanceAPIException as e:
+        if e.code == -4046:
+            add_log("✅ Margin type already ISOLATED (Error -4046 suppressed).")
+        else:
+            raise e # Re-raise any other critical API errors
+
+    # Set initial Leverage (This is also idempotent, but usually doesn't throw a specific error)
+    binance_client.futures_change_leverage(symbol=config.SYMBOL, leverage=20)
+    add_log("✅ Default leverage set successfully.")
 
 except BinanceAPIException as e:
     add_log(f"❌ Binance initialization failed: APIError(code={e.code}): {e.message}")
@@ -85,7 +105,7 @@ except Exception as e:
     exit()
 
 try:
-    # Initialize Gemini Client
+    # Gemini initialization remains the same
     genai.configure(api_key=config.GOOGLE_API_KEY)
     gemini_model = genai.GenerativeModel('gemini-2.5-flash-latest')
     add_log("✅ Gemini AI client initialized (Flash).")
@@ -93,24 +113,29 @@ except Exception as e:
     add_log(f"❌ Gemini AI initialization failed: {e}")
     exit()
 
-# --- 4. Gemini Structured Output Schema ---
+# --- 4. Gemini Structured Output Schema (Using Pydantic) ---
 
-TRADE_DECISION_SCHEMA = types.Schema(
-    type=types.Type.OBJECT,
-    properties={
-        "decision": types.Schema(type=types.Type.STRING, enum=["LONG", "SHORT", "HOLD"]),
-        "entry_price": types.Schema(type=types.Type.NUMBER),
-        "stop_loss": types.Schema(type=types.Type.NUMBER),
-        "take_profit": types.Schema(type=types.Type.NUMBER),
-        "confidence": types.Schema(type=types.Type.STRING, enum=["high", "medium", "low"]),
-        "leverage": types.Schema(type=types.Type.INTEGER),
-        "risk_per_trade_percent": types.Schema(type=types.Type.NUMBER),
-        "trailing_stop_callback": types.Schema(type=types.Type.NUMBER),
-        "order_pending_timeout_seconds": types.Schema(type=types.Type.INTEGER),
-        "reasoning": types.Schema(type=types.Type.STRING),
-    },
-    required=["decision", "entry_price", "stop_loss", "take_profit", "confidence", "leverage", "risk_per_trade_percent", "trailing_stop_callback", "order_pending_timeout_seconds", "reasoning"]
-)
+class TradeDecision(BaseModel):
+    """Defines the required structure for the AI's trading decision."""
+    
+    # Decision and Confidence
+    decision: str = Field(description="The trading action: LONG, SHORT, or HOLD.")
+    confidence: str = Field(description="The confidence level: high, medium, or low.")
+    reasoning: str = Field(description="A brief justification for the trade, referencing data.")
+    
+    # Trade Parameters (Required for LONG/SHORT, set to 0 for HOLD)
+    entry_price: float = Field(description="The target entry price.")
+    stop_loss: float = Field(description="The mandatory stop loss price.")
+    take_profit: float = Field(description="The initial take profit price.")
+    
+    # Dynamic Risk Parameters
+    leverage: int = Field(description="The leverage to use (10-20).")
+    risk_per_trade_percent: float = Field(description="The percentage of total capital to risk (0.5-2.0).")
+    trailing_stop_callback: float = Field(description="The trailing stop callback rate (0.5-2.0).")
+    order_pending_timeout_seconds: int = Field(description="Max time to wait for the limit order to fill (60-300).")
+
+# The Pydantic class itself is used as the schema definition
+TRADE_DECISION_SCHEMA = TradeDecision
 
 # --- 5. Data Acquisition and Analysis Functions ---
 
@@ -214,19 +239,21 @@ def get_gemini_decision(analysis_data):
     """
     
     try:
-        # Gemini configuration for deterministic, structured output
         response = gemini_model.generate_content(
             prompt,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
+                # Use the Pydantic class as the schema
                 response_mime_type="application/json",
-                response_schema=TRADE_DECISION_SCHEMA,
+                response_schema=TRADE_DECISION_SCHEMA, 
                 temperature=0,
             )
         )
         
+        # The response text is guaranteed to be valid JSON. We load it manually.
         decision = json.loads(response.text)
         return decision
+        
     except Exception as e:
         add_log(f"❌ Failed to parse Gemini response: {e}")
         return None
@@ -253,7 +280,7 @@ def get_current_position():
 
 def check_for_trigger(df):
     """Dynamic check for market anomalies based on alert level."""
-    if df is None or len(df) < 21: return False, "Data insufficient"
+    if df is None or len(df) < 21: return False, "Data insufficient", 0, 0
 
     vol_mult = config.NORMAL_VOLUME_SPIKE if bot_status['bot_state'] == BotState.SEARCHING.name else config.ALERT_VOLUME_SPIKE
     rng_mult = config.NORMAL_VOLATILITY_SPIKE if bot_status['bot_state'] == BotState.SEARCHING.name else config.ALERT_VOLATILITY_SPIKE
@@ -264,12 +291,16 @@ def check_for_trigger(df):
     avg_volume = last_20['volume'].mean()
     avg_range = (last_20['high'] - last_20['low']).mean()
     
-    if current['volume'] > avg_volume * vol_mult:
-        return True, f"Volume Spike ({bot_status['bot_state']})"
-    if (current['high'] - current['low']) > avg_range * rng_mult:
-        return True, f"Volatility Spike ({bot_status['bot_state']})"
+    # Calculate Ratios for logging
+    vol_ratio = current['volume'] / avg_volume if avg_volume > 0 else 0
+    rng_ratio = (current['high'] - current['low']) / avg_range if avg_range > 0 else 0
     
-    return False, "Market stable"
+    if current['volume'] > avg_volume * vol_mult:
+        return True, f"Volume Spike ({bot_status['bot_state']})", vol_ratio, rng_ratio
+    if (current['high'] - current['low']) > avg_range * rng_mult:
+        return True, f"Volatility Spike ({bot_status['bot_state']})", vol_ratio, rng_ratio
+    
+    return False, "Market stable", vol_ratio, rng_ratio
 
 def calculate_position_size(entry_price, stop_loss_price, risk_percent):
     """Calculates position size based on capital, risk, and stop distance."""
@@ -417,15 +448,28 @@ def main_loop():
                 bot_status['position'] = {"side": None, "quantity": 0, "entry_price": 0}
                 bot_status['pnl'] = {"usd": None, "percentage": 0}
             
+
             # --- State Machine Logic ---
 
             if current_bot_state == BotState.SEARCHING:
                 trigger_df = get_klines_robust(config.SYMBOL, '1m', limit=21)
-                is_triggered, reason = check_for_trigger(trigger_df)
+                
+                # Unpack the four return values
+                is_triggered, reason, vol_ratio, rng_ratio = check_for_trigger(trigger_df)
+                
+                # DIAGNOSTIC: Force trigger on startup
+                if forced_trigger_counter < 1:
+                    is_triggered = True
+                    reason = "Forced Startup Trigger"
+                    forced_trigger_counter += 1
+                
                 if is_triggered:
                     add_log(f"🎯 Market Trigger Activated! Reason: {reason}")
                     current_bot_state = BotState.ANALYZING
-                time.sleep(60)
+                else:
+                    # UX Improvement: Log current ratios to show activity
+                    add_log(f"🔍 Searching... Vol: {vol_ratio:.2f}x | Rng: {rng_ratio:.2f}x (Thresholds: {config.NORMAL_VOLUME_SPIKE}x/{config.NORMAL_VOLATILITY_SPIKE}x)")
+                    time.sleep(60)
 
             elif current_bot_state == BotState.ANALYZING:
                 analysis_bundle = run_heavy_analysis()
