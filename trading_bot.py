@@ -42,7 +42,7 @@ pending_order_start_time = 0
 current_key_index = 0
 # --- NEW: Global variables for exchange precision rules ---
 price_precision = 2  # Default, will be updated on startup
-quantity_precision = 3 # Default, will be updated on startup
+quantity_precision = 0 # Default, will be updated on startup
 
 # --- 2. Utility Functions ---
 def save_status():
@@ -83,8 +83,8 @@ try:
     exchange_info = binance_client.futures_exchange_info()
     for s in exchange_info['symbols']:
         if s['symbol'] == config.SYMBOL:
-            price_precision = s['pricePrecision']
-            quantity_precision = s['quantityPrecision']
+            price_precision = 2
+            quantity_precision = 0
             add_log(f"✅ Precision rules for {config.SYMBOL}: Price={price_precision}, Quantity={quantity_precision}")
             break
 
@@ -93,7 +93,7 @@ except Exception as e:
     exit()
 
 try:
-    gemini_model = genai.GenerativeModel('gemini-2.5-pro') # type: ignore
+    gemini_model = genai.GenerativeModel('gemini-flash-latest') # type: ignore
     add_log(f"✅ Gemini AI model loaded. Using {len(config.GEMINI_API_KEYS)} API keys for rotation.")
 except Exception as e:
     add_log(f"❌ Gemini AI initialization failed: {e}")
