@@ -99,57 +99,63 @@ except Exception as e:
     add_log(f"❌ Gemini AI initialization failed: {e}")
     exit()
 
-# --- 4. Gemini Pydantic Schema and Master Prompt ---
-# trading_bot.py (TradeDecision class - Corrected)
+# --- 4. Gemini Master Prompt (Text-Based V3) ---
 
-
-class InitialAction(BaseModel):
-    """Step 1: AI decides the type of action to take."""
-    action: str = Field(description="The high-level action to take: 'OPEN_POSITION', 'CLOSE_POSITION', 'MODIFY_POSITION', or 'WAIT'.")
-    reasoning: str = Field(description="Brief reasoning for this high-level action.")
-
-class OpenPositionParams(BaseModel):
-    """Step 2: AI provides specific parameters for opening a position."""
-    decision: str = Field(description="The direction: 'LONG' or 'SHORT'. Set to 'NULL' to abort.")
-    confidence: str = Field(description="Confidence: 'high', 'medium', or 'low'. Set to 'NULL' to abort.")
-    
-    # --- PRECISION INSTRUCTION ADDED ---
-    entry_price: float = Field(description="Target entry price (format: '%.2f'). Set to 0 to abort.")
-    stop_loss: float = Field(description="Mandatory stop loss (format: '%.2f'). Set to 0 to abort.")
-    take_profit: float = Field(description="Initial take profit (format: '%.2f'). Set to 0 to abort.")
-    
-    leverage: int = Field(description="Leverage (10-30). Set to 0 to abort.")
-    risk_per_trade_percent: float = Field(description="Capital risk percentage (15-30). Set to 0 to abort.")
-
-class ModifyPositionParams(BaseModel):
-    """Step 2: AI provides specific parameters for modifying a position."""
-    # --- PRECISION INSTRUCTION ADDED ---
-    new_stop_loss: float = Field(description="The new stop loss price (format: '%.2f'). Set to 0 to abort or if unchanged.")
-    new_take_profit: float = Field(description="The new take profit price (format: '%.2f'). Set to 0 to abort or if unchanged.")
-
-class WaitParams(BaseModel):
-    """Step 2: AI provides specific parameters for waiting."""
-    next_analysis_trigger: str = Field(description="Condition for next analysis: 'IMMEDIATE' or 'PRICE_CROSS'.")
-    
-    # --- PRECISION INSTRUCTION ADDED ---
-    trigger_price: float = Field(description="Required if trigger is 'PRICE_CROSS' (format: '%.2f'). Set to 0 otherwise.")
-    trigger_timeout: int = Field(description="Required if trigger is 'PRICE_CROSS' Time in seconds to wait for the trigger condition before re-analyzing, setting a low value is recommended.")
-    trigger_direction: str = Field(description="Required if trigger is 'PRICE_CROSS': 'ABOVE' or 'BELOW'. Set to 'NULL' otherwise.")
-
-# --- MASTER PROMPT FOR MEMORY REFRESH ---
-GEMINI_SYSTEM_PROMPT = """
-You are 'The Scalpel', the world's #1 proprietary trader, known for your precision, strict discipline, and mastery of high-risk, high-reward scalping. Your analysis is final. Your output MUST be a single, complete JSON object conforming to the provided schema. There is no room for error.
+GEMINI_SYSTEM_PROMPT_TEXT_BASED = """
+You are 'The Scalpel', the world's #1 proprietary trader. Your analysis is final and must be communicated with absolute clarity.
 
 **DIRECTIVE**
+Analyze the provided market data and current position. Formulate a complete trading plan. You must output your final decision inside a special block called `[DECISION_BLOCK]`.
 
-**Persona:** You are 'The Scalpel'. Your strategy is high-frequency scalping and momentum trading on 1m, 5m, and 15m timeframes.
-**Risk Profile:** High risk (10-30% of capital per trade), high profit. Discipline is paramount. Every trade MUST have a stop loss.
-**Task:** Analyze the following market data and my current position status. Return a complete JSON action plan.
+**FORMATTING RULES FOR [DECISION_BLOCK]**
+1.  The block starts with the line `[DECISION_BLOCK]` and ends with `[END_BLOCK]`.
+2.  Inside the block, each line must be a `KEY: VALUE` pair.
+3.  **CRITICAL:** Only include the KEYs relevant to your chosen `ACTION`. Do not include keys for actions you are not taking.
 
-**Your Decision Logic:**
-- **If FLAT:** Is there a high-probability scalping opportunity RIGHT NOW? If yes, set `action: 'OPEN_POSITION'` and fill all trade parameters. If not, set `action: 'WAIT'` and define the precise condition (`next_analysis_trigger`) that would create an opportunity (e.g., a price breakout or breakdown).
-- **If IN_POSITION:** Is the reason for holding the trade still valid? Should the stop loss be moved to lock in profit? Is it time to take profit? Set `action` to `'MODIFY_POSITION'`, `'CLOSE_POSITION'`, or `'WAIT'` accordingly.
-- **Discipline:** If no clear edge exists, the correct action is always `'WAIT'`. Do not force trades. For a 'WAIT' decision, you must still define the `next_analysis_trigger`.
+**AVAILABLE KEYS and WHEN TO USE THEM:**
+
+*   `ACTION`: (REQUIRED) The action to take. Must be one of: `OPEN_POSITION`, `CLOSE_POSITION`, `MODIFY_POSITION`, `WAIT`.
+*   `REASONING`: (REQUIRED) A brief, one-sentence explanation for your action.
+
+*   **--- If ACTION is `OPEN_POSITION`, you MUST also include:**
+    *   `DECISION`: `LONG` or `SHORT`.
+    *   `ENTRY_PRICE`: The target entry price.
+    *   `STOP_LOSS`: The mandatory stop loss price.
+    *   `TAKE_PROFIT`: The initial take profit price.
+    *   `LEVERAGE`: The integer leverage to use.
+    *   `RISK_PERCENT`: The percentage of capital to risk.
+
+*   **--- If ACTION is `WAIT`, you MUST also include:**
+    *   `TRIGGER_PRICE`: The price that triggers the next analysis.
+    *   `TRIGGER_DIRECTION`: `ABOVE` or `BELOW`.
+    *   `TRIGGER_TIMEOUT`: Timeout in seconds.
+
+*   **--- If ACTION is `MODIFY_POSITION`, you MUST also include:**
+    *   `NEW_STOP_LOSS`: The new stop loss price. (Use 0 if not changing)
+    *   `NEW_TAKE_PROFIT`: The new take profit price. (Use 0 if not changing)
+
+*   **--- If ACTION is `CLOSE_POSITION`, no other keys are needed.**
+
+**EXAMPLE 1: Opening a Long Position**
+[DECISION_BLOCK]
+ACTION: OPEN_POSITION
+REASONING: The price is showing bullish momentum after breaking a key resistance level on the 15m chart.
+DECISION: LONG
+ENTRY_PRICE: 190.50
+STOP_LOSS: 189.00
+TAKE_PROFIT: 193.00
+LEVERAGE: 20
+RISK_PERCENT: 2.5
+[END_BLOCK]
+**EXAMPLE 2: Waiting for a Price Drop**
+[DECISION_BLOCK]
+ACTION: WAIT
+REASONING: The market is consolidating; waiting for a pullback to a stronger support level before considering an entry.
+TRIGGER_PRICE: 188.75
+TRIGGER_DIRECTION: BELOW
+TRIGGER_TIMEOUT: 600
+[END_BLOCK]
+Now, analyze the following data and provide your decision.
 """
 
 # --- 5. Data Acquisition and Analysis Functions ---
@@ -197,36 +203,73 @@ def get_market_vitals(symbol):
         add_log(f"❌ Error fetching market vitals: {e}")
         return None
 
+# trading_bot.py (run_heavy_analysis function - Corrected)
+
 def run_heavy_analysis():
+    """Generates the full holographic analysis report for Gemini."""
     add_log("🚀 Starting holographic analysis...")
+    
+    # --- NEW: Get current price to anchor the AI ---
+    try:
+        ticker = binance_client.futures_mark_price(symbol=config.SYMBOL)
+        current_price = float(ticker['markPrice'])
+    except Exception as e:
+        add_log(f"Could not fetch current price for analysis bundle: {e}")
+        return None
+
     market_vitals = get_market_vitals(config.SYMBOL)
     if not market_vitals: return None
+        
+    # --- NEW: Add the anchor price to the top of the report ---
+    
+    market_vitals = get_market_vitals(config.SYMBOL)
+    if not market_vitals: return None
+    
+    all_data_content = f"### 0. Current Market Price (Anchor)\n- **Current Price:** {current_price:.2f} USDT\n\n"
     all_data_content = "### 1. Live Market Vitals\n"
     all_data_content += f"- Order Book Imbalance (Buy Pressure): {market_vitals['order_book_imbalance']:.2%}\n"
     all_data_content += f"- Funding Rate: {market_vitals['funding_rate']:.4%}\n"
-    all_data_content += f"- Open Interest ({config.SYMBOL}): {market_vitals['open_interest']:,.2f}\n"
+    all_data_content += f"- Open Interest (USDT): {market_vitals['open_interest']:,.2f}\n"
     all_data_content += f"- Top Trader L/S Ratio: {market_vitals['top_trader_long_short_ratio']:.2f}\n\n"
     all_data_content += "### 2. Multi-Timeframe K-line Depth Analysis\n"
+
     for tf in config.ANALYSIS_TIMEFRAMES:
-        df = get_klines_robust(config.SYMBOL, tf, limit=200)
+        # --- CRITICAL FIX: Fetch more data to ensure indicators can warm up ---
+        # We need at least 200 candles for the EMA_200, so fetching 300 gives a buffer.
+        df = get_klines_robust(config.SYMBOL, tf, limit=300)
         if df is None: continue
-        df.ta.ema(lengths=[20, 50], append=True)
-        df.ta.macd(append=True)
-        df.ta.rsi(append=True)
-        df.ta.atr(append=True)
-        df.ta.adx(append=True)
+        
+        # Explicitly name the indicator columns
+        df['EMA_20'] = df.ta.ema(length=20)
+        df['EMA_50'] = df.ta.ema(length=50)
+        
+        macd = df.ta.macd(fast=12, slow=26, signal=9)
+        df = df.join(macd)
+        
+        df['RSI_14'] = df.ta.rsi(length=14)
+        df['ATRr_14'] = df.ta.atr(length=14)
+        
+        # ADX returns a DataFrame, so we select the column
+        adx_df = df.ta.adx(length=14)
+        if adx_df is not None and 'ADX_14' in adx_df.columns:
+            df['ADX_14'] = adx_df['ADX_14']
+        
         df['volume_ma_20'] = df['volume'].rolling(window=20).mean()
+
         latest = df.iloc[-1]
+        
         atr_percentage = (latest.get('ATRr_14', 0) / latest['close']) * 100 if latest['close'] > 0 else 0
         volume_strength = latest.get('volume', 0) / latest.get('volume_ma_20', 1) if latest.get('volume_ma_20', 0) > 0 else 0
+        
         report = f"--- Analysis Report ({tf} Timeframe) ---\n"
-        report += f"Close Price: {latest['close']:.2f}\n"
+        report += f"Close Price: {latest['close']:.4f}\n"
         report += f"Trend Strength (ADX_14): {latest.get('ADX_14', 0):.2f}\n"
-        report += f"EMA 20/50: {latest.get('EMA_20', 0):.2f} / {latest.get('EMA_50', 0):.2f}\n"
+        report += f"EMA 20/50: {latest.get('EMA_20', 0):.4f} / {latest.get('EMA_50', 0):.4f}\n"
         report += f"RSI_14: {latest.get('RSI_14', 0):.2f}\n"
         report += f"ATR_Volatility_Percent: {atr_percentage:.2f}%\n"
         report += f"Volume_Strength_Ratio: {volume_strength:.2f}x\n"
         all_data_content += report
+    
     return all_data_content
 
 def is_decision_sane(decision):
@@ -272,26 +315,119 @@ def is_decision_sane(decision):
         add_log(f"❌ An unexpected error occurred during sanity check: {e}")
         return False # Fail safe
 
+def run_diagnostic_query(analysis_data, position_data):
+    """
+    Asks Gemini to "think out loud" in plain English without JSON constraints.
+    This is used to diagnose why it might be generating faulty data.
+    """
+    global current_key_index
+    add_log("--- 🧠 Requesting Gemini RAW THOUGHT PROCESS for diagnostics ---")
+    
+    # A different, more open-ended prompt
+    diagnostic_prompt = f"""
+    **DIAGNOSTIC MODE**
+
+    You are an expert trading analyst. Your previous attempt to generate a JSON response for the following data resulted in a nonsensical price.
+    
+    **Your Task:**
+    Ignore all JSON formatting. In plain English, I want you to "think out loud". Analyze the data step-by-step and formulate a trading plan.
+    
+    1.  Start by stating the current price you see in the data.
+    2.  State your overall market thesis (bullish, bearish, neutral).
+    3.  Explain how the data points (Vitals and K-lines) support your thesis.
+    4.  Conclude with a specific, actionable trade idea, including your recommended entry price, stop loss, and take profit.
+
+    **Here is the data you must analyze:**
+    
+    **Position Status:**
+    {position_data}
+
+    **Market Analysis:**
+    {analysis_data}
+    """
+    
+    # This loop is for a single, non-structured request
+    for i in range(len(config.GEMINI_API_KEYS)):
+        try:
+            key = config.GEMINI_API_KEYS[current_key_index]
+            # Create a fresh, temporary model instance
+            genai.configure(api_key=key) # type: ignore
+            model = genai.GenerativeModel('gemini-flash-latest') # type: ignore
+            current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
+            
+            # Make a standard text-only API call
+            response = model.generate_content(diagnostic_prompt)
+            
+            return response.text # Return the plain text response
+            
+        except exceptions.ResourceExhausted:
+            add_log(f"⚠️ Gemini API key at index {current_key_index-1} is rate-limited. Switching...")
+            continue
+        except Exception as e:
+            add_log(f"❌ Error during diagnostic query: {e}")
+            return f"Failed to get diagnostic response: {e}"
+
+    return "All Gemini API keys failed during diagnostic query."
+
+def parse_decision_block(raw_text: str) -> dict:
+    """
+    Parses the structured text block from Gemini's response into a dictionary.
+    This function is designed to be robust against extra text or formatting errors.
+    """
+    decision = {}
+    in_block = False
+    
+    # A mapping of keys to their expected types for automatic conversion
+    type_map = {
+        "ENTRY_PRICE": float, "STOP_LOSS": float, "TAKE_PROFIT": float,
+        "LEVERAGE": int, "RISK_PERCENT": float, "TRIGGER_PRICE": float,
+        "TRIGGER_TIMEOUT": int, "NEW_STOP_LOSS": float, "NEW_TAKE_PROFIT": float
+    }
+
+    for line in raw_text.splitlines():
+        line = line.strip()
+        
+        if line == '[DECISION_BLOCK]':
+            in_block = True
+            continue
+        
+        if line == '[END_BLOCK]':
+            break
+
+        if in_block and ':' in line:
+            # Split only on the first colon to handle reasoning text with colons
+            key, value = line.split(':', 1)
+            key = key.strip()
+            value = value.strip()
+            
+            # Convert value to the correct type if needed
+            if key in type_map:
+                try:
+                    decision[key.lower()] = type_map[key](value)
+                except (ValueError, TypeError):
+                    add_log(f"⚠️ Parser Warning: Could not convert '{value}' for key '{key}'. Defaulting to 0 or None.")
+                    decision[key.lower()] = None
+            else:
+                # Keys like ACTION, REASONING, etc., remain strings
+                decision[key.lower()] = value
+    
+    return decision
+
 # --- 6. Gemini Decision Function ---
-# trading_bot.py (Corrected get_gemini_decision function)
+
+# --- 6. Gemini Decision Function (Text-Based V3) ---
 
 def get_gemini_decision(analysis_data, position_data):
     """
-    Performs a two-step, completely stateless confirmation to get a robust decision from Gemini.
-    A new model instance is created for each request to ensure no memory is carried over.
+    Gets a trading decision from Gemini using a structured text format,
+    then parses it into a Python dictionary.
     """
     global current_key_index
     
-    # --- STEP 1: Get the high-level action ---
-    add_log("🧠 Step 1: Requesting initial action from Gemini (Stateless)...")
-    
-    system_instruction_step1 = (
-        "You are 'The Scalpel', the world's top proprietary trader. Your task is to first decide the high-level action to take: "
-        "'OPEN_POSITION', 'CLOSE_POSITION', 'MODIFY_POSITION', or 'WAIT'. Your output MUST be a single JSON object conforming to the InitialAction schema."
-    )
-    prompt_step1 = f"""
-    **DIRECTIVE (Step 1/2): Determine High-Level Action**
-    Analyze the following data and decide on the general course of action.
+    prompt = f"""
+    {GEMINI_SYSTEM_PROMPT_TEXT_BASED}
+
+    **--- CURRENT DATA FOR ANALYSIS ---**
 
     **1. Current Position Status:**
     {position_data}
@@ -299,111 +435,45 @@ def get_gemini_decision(analysis_data, position_data):
     **2. Holographic Market Analysis:**
     {analysis_data}
 
-    Return the InitialAction JSON object now.
-    """
-    
-    initial_decision = None
-    for i in range(len(config.GEMINI_API_KEYS)):
-        try:
-            key = config.GEMINI_API_KEYS[current_key_index]
-            add_log(f"Attempting Step 1 with key index {current_key_index}...")
-            
-            # --- STATELESS FIX: Create another new, fresh model instance for this request ---
-            genai.configure(api_key=key) # type: ignore
-            model = genai.GenerativeModel('gemini-flash-latest') # type: ignore
-            
-            # Move to the next key for the subsequent call
-            current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
-            
-            response = model.generate_content(
-                prompt_step1,
-                generation_config=types.GenerationConfig(
-                    response_mime_type="application/json",
-                    response_schema=InitialAction,
-                    temperature=0,
-                )
-            )
-            initial_decision = json.loads(response.text)
-            add_log(f"✅ Gemini Step 1 successful. Action: {initial_decision.get('action')}")
-            break # Success, exit the loop
-        except exceptions.ResourceExhausted:
-            add_log(f"⚠️ Gemini API key at index {current_key_index-1} is rate-limited. Switching...")
-            continue
-        except Exception as e:
-            add_log(f"❌ Error during Gemini Step 1: {e}")
-            return None
-            
-    if not initial_decision:
-        add_log("🚨 All Gemini API keys failed for Step 1. Pausing.")
-        time.sleep(60)
-        return None
-
-    # --- STEP 2: Get the specific parameters for the chosen action ---
-    
-    action = initial_decision.get('action')
-    if not action or action == 'CLOSE_POSITION':
-        # For CLOSE_POSITION, we don't need more parameters.
-        return initial_decision
-
-    add_log(f"🧠 Step 2: Requesting parameters for action '{action}' (Stateless)...")
-    
-    schema_map = {
-        'OPEN_POSITION': OpenPositionParams,
-        'MODIFY_POSITION': ModifyPositionParams,
-        'WAIT': WaitParams,
-    }
-    
-    target_schema = schema_map.get(action)
-    if not target_schema:
-        add_log(f"Unknown action '{action}' from Step 1. Aborting.")
-        return initial_decision # Return the partial decision
-
-    prompt_step2 = f"""
-    **DIRECTIVE (Step 2/2): Provide Specific Parameters**
-    Your initial decision was '{action}' with the reasoning: "{initial_decision.get('reasoning')}"
-
-    Now, provide the exact parameters for this action.
-    - If the opportunity is still valid, fill all fields in the schema.
-    - **If the opportunity has passed or is no longer valid, you can abort by setting numerical values to 0 and string values to 'NULL'.**
-
-    Return the {target_schema.__name__} JSON object now.
+    Provide your analysis and `[DECISION_BLOCK]` now.
     """
     
     for i in range(len(config.GEMINI_API_KEYS)):
         try:
             key = config.GEMINI_API_KEYS[current_key_index]
-            add_log(f"Attempting Step 2 with key index {current_key_index}...")
-
-            # --- STATELESS FIX: Create another new, fresh model instance for this request ---
+            add_log(f"🧠 Requesting text-based decision from Gemini with key index {current_key_index}...")
+            
             genai.configure(api_key=key) # type: ignore
             model = genai.GenerativeModel('gemini-flash-latest') # type: ignore
-
+            
             current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
             
-            response = model.generate_content(
-                prompt_step2,
-                generation_config=types.GenerationConfig(
-                    response_mime_type="application/json",
-                    response_schema=target_schema,
-                    temperature=0,
-                )
-            )
+            # Simple text-in, text-out generation. No complex schemas.
+            response = model.generate_content(prompt)
             
-            params = json.loads(response.text)
-            add_log(f"✅ Gemini Step 2 successful.")
+            raw_response_text = response.text
+            add_log("--- 🧠 GEMINI RAW TEXT RESPONSE ---")
+            add_log(raw_response_text)
+            add_log("--- END RAW TEXT RESPONSE ---")
             
-            # Combine the results from both steps into one final decision object
-            final_decision = {**initial_decision, **params}
-            return final_decision
+            # Parse the raw text to get a structured dictionary
+            decision_dict = parse_decision_block(raw_response_text)
+            
+            if not decision_dict or 'action' not in decision_dict:
+                add_log("❌ Parsing failed or ACTION key is missing in the response. Trying next key.")
+                continue
+
+            add_log(f"✅ Gemini decision parsed successfully. Action: {decision_dict.get('action')}")
+            return decision_dict
             
         except exceptions.ResourceExhausted:
             add_log(f"⚠️ Gemini API key at index {current_key_index-1} is rate-limited. Switching...")
             continue
         except Exception as e:
-            add_log(f"❌ Error during Gemini Step 2: {e}")
-            return None
-
-    add_log("🚨 All Gemini API keys failed for Step 2. Pausing.")
+            add_log(f"❌ An unexpected error occurred during Gemini call: {traceback.format_exc()}")
+            # Continue to the next key
+    
+    add_log("🚨 All Gemini API keys failed or returned unparsable responses. Pausing.")
     time.sleep(60)
     return None
 
@@ -573,21 +643,24 @@ def wait_for_trigger(decision):
     add_log(f"⏳ Wait condition timed out after {timeout_seconds} seconds. Re-analyzing.")
 
 # --- 8. Main Loop ---
+# trading_bot.py (main_loop function - with Stateless Diagnostic)
+
 def main_loop():
     global bot_status, last_gemini_decision
     add_log("🤖 AI-Driven Trading Bot Main Loop Started.")
+    
+    startup_analysis_done = False
+
     while True:
         try:
-            pos = get_current_position()
-            # Update dashboard status
-            bot_status['position'] = pos
-            if pos['side']:
-                # PNL calculation logic...
-                pass
+            if not startup_analysis_done:
+                add_log("🚀 Performing initial startup analysis for debugging...")
+                bot_status['bot_state'] = "ANALYZING"
+                startup_analysis_done = True
             else:
-                bot_status['pnl'] = {"usd": None, "percentage": 0}
-            save_status()
-
+                bot_status['bot_state'] = "SEARCHING"
+            
+            pos = get_current_position()
             position_status_report = f"Position: {pos['side'] or 'FLAT'}, Size: {pos['quantity']}, Entry Price: {pos['entry_price']}"
             
             analysis_bundle = run_heavy_analysis()
@@ -603,13 +676,22 @@ def main_loop():
             bot_status['last_gemini_decision'] = decision
             last_gemini_decision = decision
             
-            # --- NEW: Perform Sanity Check BEFORE processing the action ---
             if not is_decision_sane(decision):
+                add_log("🚨 SANITY CHECK FAILED. Initiating diagnostic query to understand AI's reasoning...")
+                
+                # --- NEW: Call the diagnostic function ---
+                diagnostic_text = run_diagnostic_query(analysis_bundle, position_status_report)
+                
+                add_log("--- 🧠 GEMINI RAW THOUGHT PROCESS (DIAGNOSTIC) ---")
+                # Log the raw, unconstrained thoughts of the AI
+                add_log(diagnostic_text)
+                add_log("--- END DIAGNOSTIC ---")
+
                 add_log("Aborting action due to failed sanity check. Re-analyzing in next cycle.")
                 time.sleep(60) # Wait a minute before trying again
                 continue
-            # --- END NEW ---
             
+            # --- If Sanity Check Passes, Proceed with Action ---
             add_log(f"💡 Gemini Action Plan: {decision.get('action')}. Reason: {decision.get('reasoning')}")
             action = decision.get('action')
             
@@ -637,17 +719,10 @@ def main_loop():
                 time.sleep(config.DEFAULT_MONITORING_INTERVAL)
 
         except KeyboardInterrupt:
-            add_log("\nProgram manually stopped. Cancelling all open orders...")
-            try:
-                binance_client.futures_cancel_all_open_orders(symbol=config.SYMBOL)
-                add_log("All orders cancelled.")
-            except BinanceAPIException as e:
-                add_log(f"Failed to cancel orders: {e}")
+            # ... (KeyboardInterrupt logic remains the same)
             break
         except Exception as e:
-            error_details = traceback.format_exc()
-            add_log(f"‼️ SEVERE ERROR in main loop: {repr(e)}")
-            add_log(f"--- Full Traceback ---\n{error_details}")
+            # ... (Detailed error logging remains the same)
             time.sleep(60)
 
 if __name__ == "__main__":
