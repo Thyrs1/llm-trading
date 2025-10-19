@@ -711,12 +711,21 @@ def main_loop():
                 else: add_log("⚠️ Gemini wants to modify but position is flat.")
                 time.sleep(config.DEFAULT_MONITORING_INTERVAL)
             elif action == 'WAIT':
-                trigger_type = decision.get('next_analysis_trigger')
-                if trigger_type == 'PRICE_CROSS':
+                # --- MODIFICATION START ---
+                # Check for the presence of trigger keys to decide the wait type.
+                # This is more robust and matches our new text-based prompt.
+                trigger_price = decision.get('trigger_price')
+                trigger_direction = decision.get('trigger_direction')
+
+                if trigger_price and trigger_direction and trigger_price > 0:
+                    add_log("Trigger conditions found, entering fast-check wait mode.")
                     wait_for_trigger(decision)
                 else:
-                    add_log(f"Gemini instructed to wait. Monitoring continuously...")
+                    # If AI says WAIT but provides no specific trigger, default to monitoring.
+                    add_log(f"Gemini instructed to wait without a specific price trigger. Monitoring continuously...")
                     time.sleep(config.DEFAULT_MONITORING_INTERVAL)
+                # --- MODIFICATION END ---
+            
             else:
                 add_log(f"Unknown action from Gemini: {action}. Waiting.")
                 time.sleep(config.DEFAULT_MONITORING_INTERVAL)
