@@ -610,19 +610,20 @@ def modify_position(decision, position):
 
 def wait_for_trigger(decision):
     """Enters a fast loop to check for a specific condition set by Gemini."""
-    trigger_type = decision.get('next_analysis_trigger')
+    # --- MODIFICATION START ---
+    # Get parameters directly, matching the new robust logic.
     price = decision.get('trigger_price')
     direction = decision.get('trigger_direction')
+    timeout_seconds = decision.get('trigger_timeout', 300) # Use default if not provided
     
-    # Add a check for valid trigger parameters
-    if not all([trigger_type, price, direction]) or price == 0 or direction == 'NULL':
+    # Simplified, robust check for valid parameters.
+    if not all([price, direction]) or price <= 0:
         add_log("⚠️ Gemini WAIT decision missing valid trigger parameters. Re-analyzing immediately.")
         return
+    # --- MODIFICATION END ---
 
     add_log(f"Entering fast-check mode. WAITING for price to cross {direction} {price}...")
     
-    # Use the timeout from the AI's decision, with a default
-    timeout_seconds = decision.get('trigger_timeout', 300)
     timeout = time.time() + timeout_seconds
     
     while time.time() < timeout:
@@ -630,10 +631,10 @@ def wait_for_trigger(decision):
             ticker = binance_client.futures_mark_price(symbol=config.SYMBOL)
             current_price = float(ticker['markPrice'])
             
-            if direction == 'ABOVE' and current_price > price:
+            if direction.upper() == 'ABOVE' and current_price > price:
                 add_log(f"🎯 Trigger condition MET: Price {current_price:.4f} crossed ABOVE {price:.4f}.")
                 return
-            if direction == 'BELOW' and current_price < price:
+            if direction.upper() == 'BELOW' and current_price < price:
                 add_log(f"🎯 Trigger condition MET: Price {current_price:.4f} crossed BELOW {price:.4f}.")
                 return
                 
