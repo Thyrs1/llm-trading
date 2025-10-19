@@ -131,10 +131,10 @@ class TradeDecision(BaseModel):
     entry_price: float = Field(description="The target entry price.")
     stop_loss: float = Field(description="The mandatory stop loss price.")
     take_profit: float = Field(description="The initial take profit price.")
-    leverage: int = Field(description="The leverage to use (10-20).")
-    risk_per_trade_percent: float = Field(description="The percentage of total capital to risk (0.5-2.0).")
+    leverage: int = Field(description="The leverage to use (10-50).")
+    risk_per_trade_percent: float = Field(description="The percentage of total capital to risk (25-90).")
     trailing_stop_callback: float = Field(description="The trailing stop callback rate in percent (0.5-2.0).")
-    order_pending_timeout_seconds: int = Field(description="Max time in seconds to wait for the limit order to fill (60-300).")
+    order_pending_timeout_seconds: int = Field(description="Max time in seconds to wait for the limit order to fill in seconds.")
 
 TRADE_DECISION_SCHEMA = TradeDecision
 

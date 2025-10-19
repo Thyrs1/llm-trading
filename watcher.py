@@ -1,4 +1,4 @@
-# watcher.py
+# watcher.py (Corrected with Time Sync)
 
 import asyncio
 from binance import AsyncClient, BinanceSocketManager
@@ -12,7 +12,6 @@ def send_telegram_notification(message):
     bot_token = config.TELEGRAM_BOT_TOKEN
     chat_id = config.TELEGRAM_CHAT_ID
     
-    # Using a code block in Telegram for clean formatting
     formatted_message = f"```\n{message}\n```"
     
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -57,9 +56,7 @@ async def process_message(msg):
             trade_qty = order_data.get('l')
             total_cost = float(order_data.get('n', 0))
             
-            action = "✅ Position Opened/Increased"
-            if order_status == 'FILLED' and order_data.get('R') == True: # ReduceOnly flag
-                action = "💰 Position Closed/Reduced"
+            action = "✅ Position Opened/Increased" if order_status in ['PARTIALLY_FILLED', 'FILLED'] else "💰 Position Closed/Reduced"
             
             message = (
                 f"{action} ✅\n\n"
@@ -80,7 +77,14 @@ async def main():
     print("="*40)
     print("Listening for all account activity in real-time...")
     
+    # --- CRITICAL FIX: Initialize client and synchronize time ---
     client = await AsyncClient.create(config.BINANCE_API_KEY, config.BINANCE_API_SECRET, testnet=config.BINANCE_TESTNET)
+    
+    # Manually synchronize time
+    server_time = await client.get_server_time()
+    client.timestamp_offset = server_time['serverTime'] - int(time.time() * 1000)
+    print("✅ Time synchronization successful.")
+    
     bm = BinanceSocketManager(client)
     
     user_socket = bm.user_socket()
