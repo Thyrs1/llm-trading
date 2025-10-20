@@ -5,6 +5,7 @@ run.sh
 run.bat
 hist_data_*
 market_context.json
+report*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -213,3 +214,4 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+report.html

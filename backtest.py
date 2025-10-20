@@ -97,15 +97,28 @@ class SimulatedExchange:
     def get_current_position(self):
         return self.position.copy()
 
-    def calculate_position_size(self, current_equity, risk_percent, entry_price, stop_loss_price):
+    def calculate_position_size(self, current_equity, available_balance, risk_percent, entry_price, stop_loss_price, leverage):
+        # --- 1. Calculate size based on RISK ---
         amount_to_risk = current_equity * (risk_percent / 100)
         price_delta = abs(entry_price - stop_loss_price)
         if price_delta == 0: return 0
-        return amount_to_risk / price_delta
+        risk_based_size = amount_to_risk / price_delta
+        
+        # --- 2. Calculate size based on MARGIN (affordability) ---
+        # Max notional value we can afford, leaving a 2% buffer for fees/slippage
+        max_position_value = available_balance * leverage * 0.97
+        margin_based_size = max_position_value / entry_price
+        
+        # --- 3. Return the SMALLER of the two sizes ---
+        final_size = min(risk_based_size, margin_based_size)
+        
+        if final_size < risk_based_size:
+            print(f"⚠️ Risk-based size ({risk_based_size:.3f}) was unaffordable. Capped by margin to {final_size:.3f}.")
+            
+        return final_size
 
     def open_position(self, side, open_price, decision):
         if self.position['side']: 
-            print("⚠️ Cannot open a new position while one is already open.")
             return False
         
         leverage = decision.get('leverage')
@@ -113,33 +126,39 @@ class SimulatedExchange:
         stop_loss = decision.get('stop_loss')
         take_profit = decision.get('take_profit')
 
-        # Critical check for valid decision parameters
         if not all([leverage, risk_percent, stop_loss, take_profit]):
-            print(f"⚠️ Decision missing critical fields (leverage, risk, sl, tp). Decision: {decision}")
+            print(f"⚠️ Decision missing critical fields. Skipping. Decision: {decision}")
             return False
 
-        # Use the AI's intended entry price for the calculation, but the `open_price` for execution
-        entry_price_for_calc = decision.get('entry_price', open_price)
+        # --- MODIFICATION ---
+        # The calculation now requires more context
+        quantity = self.calculate_position_size(
+            current_equity=self.get_total_equity(open_price),
+            available_balance=self.balance, # Use the available cash balance
+            risk_percent=risk_percent,
+            entry_price=decision.get('entry_price', open_price),
+            stop_loss_price=stop_loss,
+            leverage=leverage
+        )
+        # --- END MODIFICATION ---
 
-        quantity = self.calculate_position_size(self.get_total_equity(open_price), risk_percent, entry_price_for_calc, stop_loss)
-        
         if quantity <= 0:
-            print("⚠️ Calculated position size is zero or negative.")
+            print("⚠️ Calculated position size is zero or negative. Skipping.")
             return False
         
         required_margin = (quantity * open_price) / leverage
+        fee = (quantity * open_price) * self.commission_pct
         
-        if required_margin > self.balance:
-            print(f"🚨 MARGIN INSUFFICIENT (Simulated): Required {required_margin:.2f} but only have {self.balance:.2f}")
+        # This check should now always pass, but we keep it as a final safety net
+        if required_margin + fee > self.balance:
+            print(f"🚨 MARGIN INSUFFICIENT (Final Check): Required {required_margin+fee:.2f} but have {self.balance:.2f}")
             return False
 
-        # The fee is calculated on the notional value of the position
-        fee = (quantity * open_price) * self.commission_pct
-        self.balance -= fee # Deduct fee immediately
+        self.balance -= fee # Deduct fee
 
         self.position = {
             "side": side, 
-            "quantity": quantity, 
+            "quantity": quantity,
             "entry_price": open_price, 
             "stop_loss": stop_loss, 
             "take_profit": take_profit
@@ -304,8 +323,8 @@ def run_backtest(historical_data, sim_exchange):
 if __name__ == '__main__':
     # Define backtest parameters here
     backtest_symbol = "SOLUSDT"
-    start_date = "1 May, 2025"
-    end_date = "3 May, 2025" # A shorter period is better for initial tests due to API call speed
+    start_date = "3 June, 2025"
+    end_date = "7 June, 2025" # A shorter period is better for initial tests due to API call speed
     
     # 1. Download data
     hist_data = get_historical_data(
