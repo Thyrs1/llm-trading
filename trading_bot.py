@@ -27,7 +27,7 @@ import config
 
 # NEW LOGIC FOR FINBERT IMPLEMENTATION
 
-import requests
+import requests, feedparser, re
 from bs4 import BeautifulSoup
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 
@@ -64,8 +64,6 @@ def add_log(message):
     print(log_entry)
     save_status()
 
-
-
 # Initialize the model once to avoid reloading it every time
 try:
     add_log("🤖 Loading FinBERT sentiment model...")
@@ -99,54 +97,46 @@ def get_sentiment_score(text: str) -> float:
         return 0.0 # Return neutral on error
 
     
-def get_news_from_cryptopanic_api(symbol='SOL', limit=10):
+def get_news_from_rss(symbol: str, limit=15):
     """
-    Fetches news headlines for a specific currency using the CryptoPanic API.
-    Returns a single string of concatenated headlines.
+    Fetches headlines from multiple RSS feeds and filters them for a specific symbol.
     """
-    if not config.CRYPTOPANIC_API_KEY or config.CRYPTOPANIC_API_KEY == "paste_your_actual_api_key_here":
-        add_log("⚠️ CryptoPanic API key not configured. Skipping news fetch.")
-        return "News API not configured."
-
-    add_log(f"📰 Fetching news for {symbol} from CryptoPanic API...")
+    add_log("📰 Fetching and filtering news from RSS feeds...")
     
-    # API endpoint URL
-    url = "https://cryptopanic.com/api/v1/posts/"
+    rss_feeds = [
+        "https://cointelegraph.com/rss/tag/solana", # Example of a symbol-specific feed
+        "https://cointelegraph.com/rss",
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        # Add more general crypto news feeds here
+    ]
     
-    # Parameters for the API request
-    params = {
-        "auth_token": config.CRYPTOPANIC_API_KEY,
-        "currencies": symbol,  # Filter news for our specific symbol
-        "public": "true"
-    }
+    relevant_headlines = []
+    
+    # Create a regex pattern to find the symbol (case-insensitive)
+    # This will match "SOL", "Solana", "sol", etc.
+    # We can expand this with a dictionary for other coins.
+    coin_names = {'SOL': ['solana', 'sol']}
+    search_terms = [symbol.lower()] + coin_names.get(symbol.upper(), [])
+    pattern = re.compile(r'\b(' + '|'.join(search_terms) + r')\b', re.IGNORECASE)
 
-    try:
-        response = requests.get(url, params=params, timeout=10) # Added a timeout
-        
-        # Check if the request was successful
-        if response.status_code == 200:
-            data = response.json()
-            # Extract just the titles from the news posts
-            headlines = [post['title'] for post in data['results']]
+    for url in rss_feeds:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries:
+                # Check if the title or summary contains our symbol
+                if pattern.search(entry.title) or (hasattr(entry, 'summary') and pattern.search(entry.summary)):
+                    relevant_headlines.append(entry.title)
+        except Exception as e:
+            add_log(f"⚠️ Could not parse RSS feed {url}: {e}")
             
-            if not headlines:
-                add_log("No recent news found for the symbol.")
-                return "No recent news found."
-            
-            # Join the headlines into a single text block for FinBERT
-            return ". ".join(headlines[:limit])
-        else:
-            # Handle potential API errors
-            error_message = f"CryptoPanic API Error {response.status_code}: {response.text}"
-            add_log(f"❌ {error_message}")
-            return f"API Error: {response.status_code}"
+    if not relevant_headlines:
+        add_log(f"No specific news found for {symbol} in RSS feeds.")
+        return f"No specific news found for {symbol}."
 
-    except requests.exceptions.RequestException as e:
-        add_log(f"❌ Network error while fetching news from CryptoPanic: {e}")
-        return "News fetching failed due to network error."
-    except Exception as e:
-        add_log(f"❌ An unexpected error occurred during news fetch: {e}")
-        return "News fetching failed."
+    # Remove duplicate headlines, preserving order
+    unique_headlines = list(dict.fromkeys(relevant_headlines))
+    
+    return ". ".join(unique_headlines[:limit])
 
 # --- 3. API Client Initialization ---
 # (This section is correct and remains unchanged)
@@ -196,17 +186,6 @@ A new data point, "News Sentiment Score", is now included. This score, from -1.0
 Use this sentiment as a strong confirmation factor. For example, avoid taking a LONG position if sentiment is strongly negative, even if technicals look good.
 ...
 
-
-#  Summary: Pros and Cons of this Hybrid Approach
-
-| Pros                                                                                                | Cons                                                                                                |
-| --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| **Much More Powerful:** Combines the best of both worlds: Gemini's reasoning + FinBERT's specialty. | **More Complex:** The script now has more moving parts and dependencies.                          |
-| **Catches News-Driven Moves:** Can react to sentiment shifts that aren't yet visible on the charts. | **Local Compute:** FinBERT runs on your machine. It can be slow without a GPU.                      |
-| **Higher Quality Signals:** Gemini can use sentiment as a filter, improving the quality of its trades. | **News Reliability:** Free web scraping is fragile. A real news API costs money.                    |
-| **Maintains Core Logic:** You don't have to rewrite your entire trading execution system.             | **Prompt Engineering:** You need to ensure Gemini understands and respects the sentiment score.    |
-
-This hybrid architecture is a massive upgrade and the correct way to incorporate a specialized model like FinBERT into a sophisticated, AI-driven trading system.
 **FORMATTING RULES FOR [DECISION_BLOCK]**
 1.  Starts with `[DECISION_BLOCK]` and ends with `[END_BLOCK]`.
 2.  Inside, each line must be a `KEY: VALUE` pair.
@@ -420,7 +399,7 @@ def run_heavy_analysis():
     if not market_vitals: return None
     
     # --- NEW: Integrate Sentiment Analysis ---
-    news_headlines = get_news_from_cryptopanic_api(symbol=config.SYMBOL.replace("USDT", ""))
+    news_headlines = get_news_from_rss(symbol=config.SYMBOL.replace("USDT", ""))
     sentiment_score = get_sentiment_score(news_headlines)
     # --- END of new code ---
 
@@ -631,58 +610,117 @@ def get_current_position():
         add_log(f"Error checking position: {e}")
         return {"side": None, "quantity": 0, "entry_price": 0}
 
-def calculate_position_size(entry_price, stop_loss_price, risk_percent):
+def get_available_margin():
+    """Fetches the available USDT balance from the futures account."""
     try:
-        actual_risk_percent = min(risk_percent / 100, config.MAX_RISK_PER_TRADE)
-        amount_to_risk_usdt = config.TOTAL_CAPITAL_USDT * actual_risk_percent
+        balances = binance_client.futures_account_balance()
+        for balance in balances:
+            if balance['asset'] == 'USDT':
+                return float(balance['availableBalance'])
+        return 0.0
+    except BinanceAPIException as e:
+        add_log(f"❌ Could not fetch available margin: {e}")
+        return 0.0
+
+    
+# Add this new helper function first, to get your total equity
+def get_total_equity():
+    """Fetches the total wallet balance (equity) from the futures account."""
+    try:
+        balances = binance_client.futures_account_balance()
+        for balance in balances:
+            if balance['asset'] == 'USDT':
+                # 'balance' represents the total equity (wallet balance)
+                return float(balance['balance'])
+        return 0.0
+    except BinanceAPIException as e:
+        add_log(f"❌ Could not fetch total equity: {e}")
+        return 0.0
+
+# Now, replace your entire old calculate_position_size function with this one
+def calculate_position_size(entry_price, stop_loss_price, risk_percent):
+    """
+    Calculates position size based on a percentage of the *live* account equity.
+    """
+    try:
+        # --- DYNAMIC CAPITAL LOGIC ---
+        live_equity = get_total_equity()
+        if live_equity <= 0:
+            add_log("⚠️ Cannot calculate position size, account equity is zero or unavailable.")
+            return 0
+        
+        add_log(f"Calculating risk based on LIVE equity of {live_equity:.2f} USDT.")
+        
+        # Ensure risk percent is a fraction
+        actual_risk_fraction = min(risk_percent / 100, config.MAX_RISK_PER_TRADE)
+        amount_to_risk_usdt = live_equity * actual_risk_fraction
+        # --- END DYNAMIC CAPITAL LOGIC ---
+
         price_delta_per_unit = abs(entry_price - stop_loss_price)
-        if price_delta_per_unit == 0: return 0
+        if price_delta_per_unit == 0:
+            add_log("⚠️ Price delta is zero, cannot calculate position size.")
+            return 0
+            
         position_size_units = amount_to_risk_usdt / price_delta_per_unit
-        return round(position_size_units, 3)
+        
+        # We return the unrounded size and let the open_position function handle final precision
+        return position_size_units
+
     except Exception as e:
         add_log(f"❌ Error calculating position size: {e}")
         return 0
 
 def open_position(decision):
-    """Executes the logic to open a new position with correct precision."""
-    global bot_status, last_gemini_decision
-    bot_status['bot_state'] = "ORDER_PENDING"
+    """Executes the logic to open a new position with a margin pre-check."""
+    global bot_status
     
-    # --- MODIFICATION START ---
-    # Use the new, consistent, lowercase key names from our parser
     side = decision.get('decision')
     entry_price = decision.get('entry_price')
     stop_loss_price = decision.get('stop_loss')
     leverage = decision.get('leverage')
-    risk_percent = decision.get('risk_percent') # CORRECTED KEY NAME
-    # --- MODIFICATION END ---
+    risk_percent = decision.get('risk_percent')
     
-    if not all([side, entry_price, stop_loss_price, leverage, risk_percent is not None]): # Added 'is not None' for robustness
+    if not all([side, entry_price, stop_loss_price, leverage, risk_percent is not None]):
         add_log(f"❌ Gemini OPEN decision missing required fields. Decision: {decision}")
-        bot_status['bot_state'] = "SEARCHING"
         return
 
+    # Calculate the desired position size based on risk
+    position_size = calculate_position_size(entry_price, stop_loss_price, risk_percent)
+    if position_size <= 0:
+        add_log("Calculated position size is zero or invalid, trade cancelled.")
+        return
+        
+    add_log(f"💎 Decision: {side} | Desired Size: {position_size} | Risk: {risk_percent}% | Leverage: {leverage}x")
+
+    # --- NEW: MARGIN PRE-FLIGHT CHECK ---
+    try:
+        position_value_usdt = position_size * entry_price
+        required_margin = position_value_usdt / leverage
+        available_margin = get_available_margin()
+
+        add_log(f"🔬 Pre-flight Check: Required Margin ≈ {required_margin:.2f} USDT, Available Margin = {available_margin:.2f} USDT")
+
+        if required_margin * 1.05 > available_margin: # Added 5% buffer for safety
+            add_log(f"🚨 MARGIN PRE-CHECK FAILED: Required margin ({required_margin:.2f} USDT) exceeds available balance ({available_margin:.2f} USDT). Order cancelled.")
+            return
+        add_log("✅ Margin pre-check passed.")
+
+    except Exception as e:
+        add_log(f"❌ Error during margin pre-check: {e}")
+        return
+    # --- END OF PRE-FLIGHT CHECK ---
+    
+    bot_status['bot_state'] = "ORDER_PENDING"
     try:
         binance_client.futures_change_leverage(symbol=config.SYMBOL, leverage=leverage)
         add_log(f"⚙️ Leverage set to {leverage}x.")
     except BinanceAPIException as e:
         add_log(f"❌ Failed to set leverage: {e}")
-        bot_status['bot_state'] = "SEARCHING"
         return
 
-    position_size = calculate_position_size(entry_price, stop_loss_price, risk_percent)
-    if position_size <= 0:
-        add_log("Calculated position size is zero or invalid, trade cancelled.")
-        bot_status['bot_state'] = "SEARCHING"
-        return
-        
-    add_log(f"💎 Decision: {side} | Size: {position_size} | Risk: {risk_percent}%")
-    
     try:
-        # --- RE-INTRODUCED PYTHON FORMATTING ---
         formatted_price = f"{entry_price:.{price_precision}f}"
         formatted_quantity = f"{position_size:.{quantity_precision}f}"
-        
         add_log(f"Formatted Order: Price={formatted_price}, Qty={formatted_quantity}")
 
         order = binance_client.futures_create_order(
@@ -692,18 +730,13 @@ def open_position(decision):
             timeInForce='GTC',
             price=formatted_price,
             quantity=formatted_quantity,
-            newOrderRespType='RESULT',
-            isMakers=True
         )
-        add_log(f"✅ Post-Only Limit Order placed @ {formatted_price} (ID: {order['orderId']})")
-        # Logic to handle pending order and SL/TP placement would go here
+        add_log(f"✅ Limit Order placed @ {formatted_price} (ID: {order['orderId']})")
+        # You might need logic here to set SL/TP after the order fills
         
     except BinanceAPIException as e:
-        if e.code == -2021: 
-            add_log("⚠️ Order failed: Price would execute immediately (Taker).")
-        else: 
-            add_log(f"❌ Binance order failed: {e}")
-        bot_status['bot_state'] = "SEARCHING"
+        # The pre-check should prevent -2019, but we keep this for other errors
+        add_log(f"❌ Binance order failed: {e}")
 
 def close_position(position):
     add_log(f"Executing Gemini's instruction to CLOSE position...")
