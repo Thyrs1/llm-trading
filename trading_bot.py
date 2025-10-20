@@ -544,7 +544,7 @@ def summarize_and_learn(trade_history_entry: str):
     add_log("🚨 All API keys failed during trade summarization.")
 
 
-def get_gemini_decision(analysis_data, position_data, last_context_summary):
+def get_gemini_decision(analysis_data, position_data, last_context_summary, live_equity):
     """Gets a trading decision from Gemini, including long-term memory."""
     global current_key_index
     try:
@@ -553,7 +553,14 @@ def get_gemini_decision(analysis_data, position_data, last_context_summary):
     except FileNotFoundError:
         lessons = "No past trade lessons available yet."
 
+    # live_equity = get_total_equity()
+
     prompt = f"""{GEMINI_SYSTEM_PROMPT_TEXT_BASED}
+    
+**--- CRITICAL ACCOUNT CONSTRAINTS ---**
+My current account equity is only ${live_equity:.2f} USDT. You MUST provide parameters that are realistic for this small account size. A large position with a tight stop-loss may be impossible to open due to margin requirements. Be pragmatic.
+**----------------------------------------------------**
+
 **--- STRATEGIC MEMORY: LESSONS FROM PAST TRADES ---**
 {lessons}
 **----------------------------------------------------**
@@ -867,6 +874,7 @@ def main_loop():
             if is_in_position:
                 last_position_details = pos.copy()
             
+            bot_status['market_context'] = market_context
             bot_status['bot_state'] = "SEARCHING"
             position_status_report = f"Position: {pos['side'] or 'FLAT'}, Size: {pos['quantity']}, Entry Price: {pos['entry_price']}"
             
@@ -877,8 +885,9 @@ def main_loop():
             context_summary = "\n".join([f"- {k.replace('_', ' ').title()}: {v}" for k, v in market_context.items()])
             if not context_summary:
                 context_summary = "No market context from previous sessions is available."
-
-            decision, new_context = get_gemini_decision(analysis_bundle, position_status_report, context_summary)
+            
+            current_live_equity = get_total_equity()
+            decision, new_context = get_gemini_decision(analysis_bundle, position_status_report, context_summary, current_live_equity)
             
             if new_context:
                 market_context = new_context

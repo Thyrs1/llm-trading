@@ -1,8 +1,8 @@
-<!-- templates/index.html (v3 - Updated for new key names) -->
+<!-- templates/index.html (v4 - With Market Context Card) -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
+    <meta charset="UTF--8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Gemini Trading Bot Dashboard</title>
     <style>
@@ -13,9 +13,9 @@
         }
         body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif; background-color: var(--bg-color); color: var(--text-color); margin: 0; padding: 20px; }
         .container { max-width: 1400px; margin: auto; display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; }
-        .card { background-color: var(--card-bg); border-radius: 8px; padding: 20px; border: 1px solid var(--border-color); }
+        .card { background-color: var(--card-bg); border-radius: 8px; padding: 20px; border: 1px solid var(--border-color); display: flex; flex-direction: column; }
         h2 { color: var(--primary-color); border-bottom: 2px solid #373737; padding-bottom: 10px; margin-top: 0; font-weight: 500; font-size: 1.2em; }
-        .status-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; }
+        .status-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; margin-top: auto; } /* Aligns content */
         .status-item { display: flex; flex-direction: column; }
         .status-item span:first-child { font-size: 0.8em; color: var(--subtle-text); text-transform: uppercase; letter-spacing: 0.5px; }
         .status-item span:last-child { font-size: 1.4em; font-weight: bold; }
@@ -27,21 +27,20 @@
         .state-ORDER_PENDING { background-color: #14213d; color: #e0e0e0;}
         .state-IN_POSITION { background-color: var(--secondary-color); color: #121212; }
         .state-COOL_DOWN { background-color: #6d6875; color: #e0e0e0;}
-        pre { background-color: #2c2c2c; padding: 15px; border-radius: 5px; white-space: pre-wrap; word-wrap: break-word; font-family: 'SF Mono', 'Courier New', monospace; font-size: 0.9em; line-height: 1.6;}
+        pre { background-color: #2c2c2c; padding: 15px; border-radius: 5px; white-space: pre-wrap; word-wrap: break-word; font-family: 'SF Mono', 'Courier New', monospace; font-size: 0.9em; line-height: 1.6; margin-top: 10px; flex-grow: 1; }
         ul { list-style: none; padding: 0; max-height: 400px; overflow-y: auto; }
         li { background-color: #2c2c2c; padding: 8px 12px; border-radius: 4px; margin-bottom: 5px; font-size: 0.9em; font-family: 'SF Mono', 'Courier New', monospace; border-left: 3px solid var(--primary-color);}
         .grid-col-span-2 { grid-column: span 2; }
         .grid-col-span-4 { grid-column: span 4; }
         .spinner { border: 2px solid #f3f3f3; border-top: 2px solid var(--primary-color); border-radius: 50%; width: 12px; height: 12px; animation: spin 1s linear infinite; display: inline-block; margin-right: 8px;}
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        .action-plan-details { margin-top: 10px; font-family: 'SF Mono', 'Courier New', monospace; }
+        .action-plan-details { margin-top: auto; font-family: 'SF Mono', 'Courier New', monospace; } /* Aligns content */
         .action-plan-details div { margin-bottom: 5px; }
-        .action-plan-details .label { color: var(--subtle-text); display: inline-block; width: 110px; } /* Increased width for better alignment */
+        .action-plan-details .label { color: var(--subtle-text); display: inline-block; width: 110px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <!-- All other cards remain the same -->
         <div class="card grid-col-span-2">
             <h2>Bot Status</h2>
             <div class="status-grid">
@@ -63,7 +62,7 @@
         </div>
 
         <div class="card grid-col-span-2">
-            <h2>💡 Gemini's Action Plan</h2>
+            <h2>💡 AI Action Plan</h2>
             <div class="status-item">
                 <span>Current Action</span>
                 <span id="action" style="font-size: 2em; color: var(--secondary-color);">--</span>
@@ -73,9 +72,19 @@
             </div>
         </div>
 
+        <!-- NEW CARD FOR MARKET ANALYSIS -->
         <div class="card grid-col-span-2">
-            <h2>🧠 Gemini's Reasoning</h2>
-            <pre id="reasoning">Awaiting first analysis...</pre>
+            <h2>🧠 AI Market Analysis</h2>
+            <div class="status-item">
+                <span>Market Thesis</span>
+                <pre id="market-thesis">Awaiting first analysis...</pre>
+            </div>
+            <div class="status-grid" style="margin-top: 15px;">
+                <div class="status-item"><span>Key Support</span><span id="key-support">--</span></div>
+                <div class="status-item"><span>Key Resistance</span><span id="key-resistance">--</span></div>
+                <div class="status-item"><span>Dominant Trend</span><span id="dominant-trend">--</span></div>
+                <div class="status-item"><span>Action Reasoning</span><span id="reasoning">--</span></div>
+            </div>
         </div>
 
         <div class="card grid-col-span-4">
@@ -90,9 +99,8 @@
         const botStartTime = Date.now();
 
         function formatNumber(num, digits = 4) {
-            // Check for both null and undefined, and also handle 0 correctly
-            if (num === null || typeof num === 'undefined') {
-                return '--';
+            if (num === null || typeof num === 'undefined' || num === 0) {
+                return num === 0 ? '0.00' : '--';
             }
             return parseFloat(num).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: digits });
         }
@@ -108,44 +116,34 @@
 
         function renderActionDetails(decision) {
             const container = document.getElementById('action-details-container');
-            container.innerHTML = ''; // Clear previous details
+            container.innerHTML = ''; 
 
             if (!decision || !decision.action) {
                 container.innerHTML = '<span>No action plan available.</span>';
                 return;
             }
-
-            const action = decision.action.toLowerCase(); // Use lowercase for robust matching
-            let detailsHtml = '';
             
-            // Normalize keys to lowercase to match the parser's output
-            const d = Object.fromEntries(
-                Object.entries(decision).map(([k, v]) => [k.toLowerCase(), v])
-            );
+            const d = Object.fromEntries(Object.entries(decision).map(([k, v]) => [k.toLowerCase(), v]));
+            const action = d.action;
+            let detailsHtml = '';
 
             if (action === 'wait') {
-                const trigger = d.next_analysis_trigger;
-                if (trigger && trigger.toLowerCase() === 'price_cross') {
-                    detailsHtml = `<div class="status-item">
+                if (d.trigger_price && d.trigger_direction) {
+                     detailsHtml = `<div class="status-item">
                                        <span>Trigger Condition</span>
                                        <span style="font-size: 1.5em;">🎯 ${d.trigger_direction} ${formatNumber(d.trigger_price)}</span>
                                    </div>`;
                 } else {
-                    detailsHtml = `<div class="status-item">
-                                       <span>Next Action</span>
-                                       <span style="font-size: 1.5em;">Continuous Monitoring</span>
-                                   </div>`;
+                     detailsHtml = `<div class="status-item"><span>Next Step</span><span style="font-size: 1.5em;">Continuous Monitoring</span></div>`;
                 }
             } else if (action === 'open_position') {
                 detailsHtml = `
                     <div class="action-plan-details">
-                        <div><span class="label">Direction:</span> <strong>${d.decision || '--'}</strong></div>
-                        <div><span class="label">Confidence:</span> ${d.confidence || '--'}</div>
+                        <div><span class="label">Direction:</span> <strong>${d.decision || '--'}</strong> (${d.confidence || 'N/A'})</div>
                         <div><span class="label">Entry:</span> ${formatNumber(d.entry_price)}</div>
                         <div><span class="label">Stop Loss:</span> ${formatNumber(d.stop_loss)}</div>
                         <div><span class="label">Take Profit:</span> ${formatNumber(d.take_profit)}</div>
                         <div><span class="label">Leverage:</span> ${d.leverage || '--'}x</div>
-                        <!-- *** THIS IS THE FIX *** -->
                         <div><span class="label">Risk:</span> ${d.risk_percent || '--'}%</div>
                     </div>`;
             } else if (action === 'modify_position') {
@@ -157,7 +155,6 @@
             } else if (action === 'close_position') {
                 detailsHtml = `<div class="status-item"><span>Instruction</span><span style="font-size: 1.5em;">Close position at market.</span></div>`;
             }
-
             container.innerHTML = detailsHtml;
         }
 
@@ -169,12 +166,60 @@
 
                 // Bot Status Card
                 const stateEl = document.getElementById('bot-state');
-                const stateText = data.bot_state || '--';
+                const stateText = data.bot_state || 'UNKNOWN';
                 if (stateText.toLowerCase() === 'analyzing') {
                     stateEl.innerHTML = `<div class="spinner"></div>ANALYZING`;
                 } else {
                     stateEl.innerHTML = stateText;
                 }
-                stateEl.className = 'state-' + (data.bot_state || 'UNKNOWN');
+                stateEl.className = 'state-' + stateText;
                 document.getElementById('symbol').textContent = data.symbol || '--';
-                document.getElementById('last-update').textContent = data.last_update ? new Date(da
+                document.getElementById('last-update').textContent = data.last_update ? new Date(data.last_update).toLocaleTimeString() : '--';
+
+                // Position Card
+                document.getElementById('pos-side').textContent = data.position.side || 'FLAT';
+                document.getElementById('pos-entry').textContent = formatNumber(data.position.entry_price);
+                document.getElementById('pos-size').textContent = data.position.quantity ? `${data.position.quantity} ${data.symbol.replace('USDT','')}` : '--';
+                const pnlEl = document.getElementById('pnl');
+                if (data.pnl && data.pnl.usd !== null) {
+                    pnlEl.textContent = `${formatNumber(data.pnl.usd)} USDT (${data.pnl.percentage.toFixed(2)}%)`;
+                    pnlEl.className = data.pnl.usd >= 0 ? 'positive' : 'negative';
+                } else { pnlEl.textContent = '--'; pnlEl.className = ''; }
+
+                // AI Action Plan Card
+                const decision = data.last_gemini_decision;
+                document.getElementById('action').textContent = decision ? (decision.action || '--') : '--';
+                renderActionDetails(decision);
+
+                // AI Market Analysis Card (NEW)
+                const context = data.market_context;
+                document.getElementById('market-thesis').textContent = context ? (context.market_thesis || '...') : 'Awaiting context...';
+                document.getElementById('key-support').textContent = context ? formatNumber(context.key_support) : '--';
+                document.getElementById('key-resistance').textContent = context ? formatNumber(context.key_resistance) : '--';
+                document.getElementById('dominant-trend').textContent = context ? (context.dominant_trend || '--') : '--';
+                document.getElementById('reasoning').textContent = decision ? (decision.reasoning || '...') : '...';
+                
+                // Activity Log
+                const logEl = document.getElementById('activity-log');
+                logEl.innerHTML = '';
+                if (data.log && data.log.length > 0) {
+                    data.log.forEach(entry => { 
+                        const li = document.createElement('li'); 
+                        li.textContent = entry; 
+                        logEl.appendChild(li); 
+                    });
+                } else { 
+                    logEl.innerHTML = '<li>No activity yet.</li>'; 
+                }
+
+            } catch (error) {
+                console.error("Error fetching status:", error);
+            }
+        }
+
+        setInterval(fetchStatus, 2000); // Fetch slightly faster
+        setInterval(updateUptime, 1000);
+        document.addEventListener('DOMContentLoaded', fetchStatus);
+    </script>
+</body>
+</html>

@@ -20,7 +20,7 @@ import config
 from trading_bot import (
     GEMINI_SYSTEM_PROMPT_TEXT_BASED,
     parse_decision_block,
-    parse_context_block,
+    get_gemini_decision
 )
 
 # --- Backtester Configuration ---
@@ -103,29 +103,51 @@ class SimulatedExchange:
         if price_delta == 0: return 0
         return amount_to_risk / price_delta
 
-    def open_position(self, side, price, decision):
-        if self.position['side']: return False
+    def open_position(self, side, open_price, decision):
+        if self.position['side']: 
+            print("⚠️ Cannot open a new position while one is already open.")
+            return False
         
-        leverage = decision.get('leverage', 20)
-        risk_percent = decision.get('risk_percent', 5)
+        leverage = decision.get('leverage')
+        risk_percent = decision.get('risk_percent')
         stop_loss = decision.get('stop_loss')
         take_profit = decision.get('take_profit')
 
-        if not all([stop_loss, take_profit]):
-            print("⚠️ Decision missing SL or TP, cannot open position.")
+        # Critical check for valid decision parameters
+        if not all([leverage, risk_percent, stop_loss, take_profit]):
+            print(f"⚠️ Decision missing critical fields (leverage, risk, sl, tp). Decision: {decision}")
             return False
 
-        quantity = self.calculate_position_size(self.get_total_equity(price), risk_percent, price, stop_loss)
-        required_margin = (quantity * price) / leverage
-        fee = (quantity * price) * self.commission_pct
+        # Use the AI's intended entry price for the calculation, but the `open_price` for execution
+        entry_price_for_calc = decision.get('entry_price', open_price)
 
-        if self.balance < required_margin + fee:
+        quantity = self.calculate_position_size(self.get_total_equity(open_price), risk_percent, entry_price_for_calc, stop_loss)
+        
+        if quantity <= 0:
+            print("⚠️ Calculated position size is zero or negative.")
+            return False
+        
+        required_margin = (quantity * open_price) / leverage
+        
+        if required_margin > self.balance:
             print(f"🚨 MARGIN INSUFFICIENT (Simulated): Required {required_margin:.2f} but only have {self.balance:.2f}")
             return False
 
-        self.position = {"side": side, "quantity": quantity, "entry_price": price, "stop_loss": stop_loss, "take_profit": take_profit}
-        self.trades.append(f"OPEN {side} | Qty: {quantity:.3f} @ {price:.4f}")
-        print(f"✅ OPEN {side} | Size: {quantity:.3f} @ {price:.4f} | SL: {stop_loss} TP: {take_profit}")
+        # The fee is calculated on the notional value of the position
+        fee = (quantity * open_price) * self.commission_pct
+        self.balance -= fee # Deduct fee immediately
+
+        self.position = {
+            "side": side, 
+            "quantity": quantity, 
+            "entry_price": open_price, 
+            "stop_loss": stop_loss, 
+            "take_profit": take_profit
+        }
+        
+        trade_log = f"OPEN {side} | Size: {quantity:.3f} @ {open_price:.4f} | SL: {stop_loss} TP: {take_profit} | Fee: {fee:.2f}"
+        self.trades.append(trade_log)
+        print(f"✅ {trade_log}")
         return True
 
     def close_position(self, price, reason="AI Decision"):
@@ -185,34 +207,37 @@ def create_backtest_analysis_bundle(df_slice):
     report += f"RSI_14: {latest.get('RSI_14', 0):.2f}\n"
     return report
 
-def get_backtest_gemini_decision(analysis_data, position_data):
-    """Calls the Gemini API. This is the bottleneck of the backtest."""
-    global current_key_index
-    prompt = f"""{GEMINI_SYSTEM_PROMPT_TEXT_BASED}
-**--- IMPORTANT: THIS IS A BACKTESTING SIMULATION ---**
-You are operating on historical data. News sentiment and live market vitals are NOT available. Base your decision solely on the provided price action and technical indicators.
-**----------------------------------------------------**
-**--- CURRENT DATA FOR ANALYSIS ---**
-**1. Current Position Status:** {position_data}
-**2. Holographic Market Analysis:** {analysis_data}
-Provide your full response."""
-    for i in range(len(config.GEMINI_API_KEYS)):
-        try:
-            key = config.GEMINI_API_KEYS[current_key_index]
-            genai.configure(api_key=key)
-            model = genai.GenerativeModel('gemini-1.5-flash-latest')
-            current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
-            response = model.generate_content(prompt, generation_config={"temperature": 0.2})
-            decision = parse_decision_block(response.text)
-            if decision and 'action' in decision:
-                return decision
-        except exceptions.ResourceExhausted:
-            print(f"Key {current_key_index-1} rate-limited. Switching...")
-            time.sleep(API_RETRY_DELAY)
-        except Exception as e:
-            print(f"❌ Gemini API Error: {e}. Retrying in {API_RETRY_DELAY}s")
-            time.sleep(API_RETRY_DELAY)
-    return None
+# def get_backtest_gemini_decision(analysis_data, position_data, current_equity):
+#     """Calls the Gemini API. This is the bottleneck of the backtest."""
+#     global current_key_index
+#     prompt = f"""{GEMINI_SYSTEM_PROMPT_TEXT_BASED}
+# **--- IMPORTANT: THIS IS A BACKTESTING SIMULATION ---**
+# You are operating on historical data. News sentiment and live market vitals are NOT available. Base your decision solely on the provided price action and technical indicators.
+# Your simulated account equity is ${current_equity:.2f} USDT. You MUST provide realistic parameters. A large position with a tight stop-loss may be impossible to open due to margin requirements.
+# **----------------------------------------------------**
+# **--- CURRENT DATA FOR ANALYSIS ---**
+# **1. Current Position Status:** {position_data}
+# **2. Holographic Market Analysis:** {analysis_data}
+# Provide your full response."""
+#     for i in range(len(config.GEMINI_API_KEYS)):
+#         try:
+#             key = config.GEMINI_API_KEYS[current_key_index]
+#             genai.configure(api_key=key)
+#             model = genai.GenerativeModel('gemini-2.5-pro')
+#             current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
+#             response = model.generate_content(prompt, generation_config={"temperature": 0.2})
+#             decision = parse_decision_block(response.text)
+#             if decision and 'action' in decision:
+#                 return decision
+#         except exceptions.ResourceExhausted:
+#             print(f"Key {current_key_index-1} rate-limited. Switching...")
+#             time.sleep(API_RETRY_DELAY)
+#         except Exception as e:
+#             print(f"❌ Gemini API Error: {e}. Retrying in {API_RETRY_DELAY}s")
+#             time.sleep(API_RETRY_DELAY)
+#     return None
+# imported from trading_bot.py:
+# get_gemini_decision
 
 # --- 4. The Main Backtesting Loop ---
 
@@ -251,12 +276,22 @@ def run_backtest(historical_data, sim_exchange):
             analysis_bundle = create_backtest_analysis_bundle(current_data_slice.copy()) # Use copy to avoid SettingWithCopyWarning
             position_status_report = f"Position: {pos['side'] or 'FLAT'}, Size: {pos['quantity']:.3f}, Entry: {pos['entry_price']:.4f}"
             
-            decision = get_backtest_gemini_decision(analysis_bundle, position_status_report)
+            # --- MODIFICATION ---
+            # Call the unified function with the correct arguments
+            current_sim_equity = sim_exchange.get_total_equity(current_price)
+            decision, _ = get_gemini_decision(
+                analysis_bundle, 
+                position_status_report,
+                "Backtesting session - no context.", # Context is less important in backtest
+                current_sim_equity # Pass the simulated equity here
+            )
+            # --- END MODIFICATION ---
             
             if decision:
                 action = decision.get('action')
+                print(f"🧠 AI Decision Received: {decision}")
                 if action == 'OPEN_POSITION' and not pos['side']:
-                    sim_exchange.open_position(decision.get('decision'), current_price, decision)
+                    sim_exchange.open_position(decision.get('decision'), current_candle['open'], decision)
                 elif action == 'CLOSE_POSITION' and pos['side']:
                     sim_exchange.close_position(current_price)
 
@@ -269,8 +304,8 @@ def run_backtest(historical_data, sim_exchange):
 if __name__ == '__main__':
     # Define backtest parameters here
     backtest_symbol = "SOLUSDT"
-    start_date = "1 May, 2024"
-    end_date = "7 May, 2024" # A shorter period is better for initial tests due to API call speed
+    start_date = "1 May, 2025"
+    end_date = "3 May, 2025" # A shorter period is better for initial tests due to API call speed
     
     # 1. Download data
     hist_data = get_historical_data(
