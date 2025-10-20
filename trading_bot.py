@@ -190,10 +190,10 @@ try:
         api_key=config.DEEPSEEK_API_KEY,
         base_url=config.DEEPSEEK_BASE_URL,
     )
-    client.models.lists()  # Test call to ensure client works
+    # client.models.lists()  # Test call to ensure client works
     add_log("✅ OpenAI/DeepSeek client initialized successfully.")
     
-    AI_MODEL_NAME = "deepseek-reasoner"
+    AI_MODEL_NAME = "deepseek-chat"
     
 except Exception as e:
     add_log(f"❌ OpenAI/DeepSeek initialization failed: {e}")
@@ -259,6 +259,9 @@ After `[END_BLOCK]`, you MUST provide a `[MARKET_CONTEXT_BLOCK]`. This is your p
 *   `KEY_RESISTANCE_LEVELS`: A comma-separated list of the 2-3 most important resistance price levels (e.g., "192.80, 195.00, 200.00").
 *   `DOMINANT_TREND_TIMEFRAME`: The timeframe (e.g., 5m, 15m, 1h, 4h) that you believe is currently driving the price action.
 ...
+
+**TO BE NOTED: Response Length Limit**
+Your Response must as clear and concise as possible while still in the met of FORMATTING RULES. Use abbreviations where possible without losing clarity.
 
 **EXAMPLE of the full output:**
 [DECISION_BLOCK]
@@ -601,7 +604,7 @@ def summarize_and_learn(trade_history_entry: str):
             ],
             temperature=0.3
         )
-        lesson = response.text.strip()
+        lesson = response.choices[0].message.content.strip()
         if "Lesson:" in lesson:
             add_log(f"💡 New lesson learned: {lesson}")
             with open("trade_memory.txt", "a") as f:
@@ -659,7 +662,7 @@ Based on your memory, your last analysis, and the new data, provide your full re
             ],
             temperature=0.3
         )
-        raw_response_text = response.text
+        raw_response_text = response.choices[0].message.content
         add_log("--- 🧠 AI MODEL RAW TEXT RESPONSE ---"); add_log(raw_response_text); add_log("--- END RAW TEXT RESPONSE ---")
             
         decision_dict = parse_decision_block(raw_response_text)

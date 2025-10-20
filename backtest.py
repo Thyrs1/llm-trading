@@ -18,7 +18,7 @@ from google.api_core import exceptions
 import config 
 # We will import the logic from the trading bot
 from trading_bot import (
-    GEMINI_SYSTEM_PROMPT_TEXT_BASED,
+    AI_SYSTEM_PROMPT_TEXT_BASED,
     parse_decision_block,
     get_ai_decision
 )
