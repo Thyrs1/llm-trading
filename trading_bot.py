@@ -190,7 +190,7 @@ try:
         api_key=config.DEEPSEEK_API_KEY,
         base_url=config.DEEPSEEK_BASE_URL,
     )
-    client.models_lists()  # Test call to ensure client works
+    client.models.lists()  # Test call to ensure client works
     add_log("✅ OpenAI/DeepSeek client initialized successfully.")
     
     AI_MODEL_NAME = "deepseek-reasoner"
