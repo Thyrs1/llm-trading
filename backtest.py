@@ -20,23 +20,48 @@ import config
 from trading_bot import (
     GEMINI_SYSTEM_PROMPT_TEXT_BASED,
     parse_decision_block,
-    get_gemini_decision
+    get_ai_decision
 )
+    
+from collections import deque
+import json
+
+from openai import OpenAI
+from openai import APIStatusError, APITimeoutError # New error types
+
+# --- Backtest State for Dashboard Compatibility ---
+BACKTEST_LOG = deque(maxlen=30)
+LAST_GEMINI_DECISION = {}
+LAST_MARKET_CONTEXT = {}
+CURRENT_BOT_STATE = "STARTING_BACKTEST"
+
+  
 
 # --- Backtester Configuration ---
 INITIAL_CAPITAL = 1000.00  # Starting balance in USDT
 COMMISSION_PCT = 0.04       # Commission fee per trade (0.04% is standard for Binance Futures)
 API_RETRY_DELAY = 10        # Seconds to wait after a Gemini API error
 
-# --- Gemini API Initialization ---
-current_key_index = 0
+# --- DEEPSEEK API Initialization ---
 try:
-    genai.configure(api_key=config.GEMINI_API_KEYS[0])
-    print(f"✅ Gemini AI model configured. Using {len(config.GEMINI_API_KEYS)} API keys for rotation.")
+    print("🤖 Initializing DeepSeek AI client...")
+    
+    # Initialize the client, pointing to the DeepSeek base URL and API key
+    ai_client = OpenAI(
+        api_key=config.DEEPSEEK_API_KEY,
+        base_url=config.DEEPSEEK_BASE_URL, # Use the DeepSeek URL
+        temperature=0.3
+    )
+    # Ping the service just to verify connectivity (optional, but good practice)
+    ai_client.models.list() 
+    
+    # DeepSeek model name
+    AI_MODEL_NAME = 'deepseek-chat' # or 'deepseek-chat', depending on your goal
+    
+    print(f"✅ DeepSeek AI client initialized successfully (Model: {AI_MODEL_NAME}).")
 except Exception as e:
-    print(f"❌ Gemini AI initialization failed: {e}")
+    print(f"❌ DeepSeek AI initialization failed: {e}")
     exit()
-
 # --- 1. Historical Data Retrieval ---
 
 def get_historical_data(symbol, start_str, end_str, interval=Client.KLINE_INTERVAL_5MINUTE):
@@ -68,6 +93,64 @@ def get_historical_data(symbol, start_str, end_str, interval=Client.KLINE_INTERV
     print(f"✅ Downloaded and saved {len(df_to_save)} candles to {filepath}")
     return df_to_save
 
+def bt_add_log(message):
+    """Adds a log message to the backtest deque and prints it."""
+    print(message)
+    # Prepend with a generic timestamp or just the message since it's a simulation
+    BACKTEST_LOG.appendleft(message)
+
+def save_backtest_status(sim_exchange, current_candle_time, current_price, symbol):
+    """Generates a status.json file compatible with the live dashboard."""
+    
+    # 1. Calculate Unrealized PNL for the dashboard
+    pos = sim_exchange.position
+    upnl_usd = 0
+    upnl_pct = 0
+    if pos['side']:
+        if pos['side'] == 'LONG':
+            upnl_usd = (current_price - pos['entry_price']) * pos['quantity']
+        else: # SHORT
+            upnl_usd = (pos['entry_price'] - current_price) * pos['quantity']
+        
+        # Calculate percentage based on initial margin used (approximate)
+        initial_margin = (pos['quantity'] * pos['entry_price']) / 20 # Assuming 20x for visualization
+        if initial_margin > 0:
+            upnl_pct = (upnl_usd / initial_margin) * 100
+
+    # 2. Determine simulated bot state
+    global CURRENT_BOT_STATE
+    if pos['side']:
+        CURRENT_BOT_STATE = "BACKTEST_IN_POS"
+    else:
+        CURRENT_BOT_STATE = "BACKTEST_SEARCH"
+
+    # 3. Construct the status dictionary
+    status = {
+        "bot_state": CURRENT_BOT_STATE,
+        "symbol": symbol,
+        # Use the SIMULATED time so the dashboard shows where we are in history
+        "last_update": str(current_candle_time),
+        "position": {
+            "side": pos['side'],
+            "quantity": pos['quantity'],
+            "entry_price": pos['entry_price']
+        },
+        "pnl": {
+            "usd": upnl_usd if pos['side'] else None,
+            "percentage": upnl_pct if pos['side'] else 0
+        },
+        "last_gemini_decision": LAST_GEMINI_DECISION,
+        "market_context": LAST_MARKET_CONTEXT,
+        "log": list(BACKTEST_LOG)
+    }
+
+    # 4. Write to file
+    try:
+        with open('status.json', 'w') as f:
+            json.dump(status, f, indent=4)
+    except Exception as e:
+        print(f"⚠️ Could not write backtest status: {e}")
+
 # --- 2. The Simulated Exchange Environment ---
 
 class SimulatedExchange:
@@ -76,6 +159,11 @@ class SimulatedExchange:
         self.balance = initial_balance
         self.commission_pct = commission_pct / 100
         self.position = {"side": None, "quantity": 0, "entry_price": 0, "stop_loss": 0, "take_profit": 0}
+        self.wait_condition = { # NEW: Store the active wait instruction
+            "trigger_price": None,
+            "trigger_direction": None,
+            "action_on_trigger": None # What action to take if triggered
+        }
         self.trades = []
         self.balance_history = []
         self.timestamps = []
@@ -206,24 +294,66 @@ class SimulatedExchange:
 
 def create_backtest_analysis_bundle(df_slice):
     """
-    Creates a simplified analysis bundle using only historical data.
-    No live vitals, news, or order book data is used.
+    Creates an enhanced analysis bundle using technical data and explicit momentum signals.
     """
+    if len(df_slice) < 50: # Minimum data needed for good indicators
+        return "Not enough data for comprehensive analysis."
+
     current_price = df_slice.iloc[-1]['close']
     report = f"### 0. Current Market Price (Anchor)\n- **Current Price:** {current_price:.4f} USDT\n\n"
-    report += "### 1. Multi-Timeframe K-line Depth Analysis\n"
-    
-    # We use the same dataframe for all "timeframes" in this simplified version
-    for tf_length in [20, 50, 200]:
-        df_slice[f'EMA_{tf_length}'] = ta.ema(df_slice['close'], length=tf_length)
+
+    # --- 1. Calculate Standard Indicators ---
+    df_slice['EMA_20'] = ta.ema(df_slice['close'], length=20)
+    df_slice['EMA_50'] = ta.ema(df_slice['close'], length=50)
     df_slice['RSI_14'] = ta.rsi(df_slice['close'], length=14)
+    # Using the standard pandas ta library for MACD and ADX (if available in your simplified setup)
+    macd = df_slice.ta.macd(close=df_slice['close'])
+    df_slice = pd.concat([df_slice, macd], axis=1) 
+    adx_df = df_slice.ta.adx(length=14)
+    df_slice['ADX_14'] = adx_df['ADX_14'] if 'ADX_14' in adx_df.columns else 0
     
     latest = df_slice.iloc[-1]
     
-    report += f"--- Analysis Report (Input Timeframe) ---\n"
-    report += f"Close Price: {latest['close']:.4f}\n"
-    report += f"EMA 20/50: {latest.get('EMA_20', 0):.4f} / {latest.get('EMA_50', 0):.4f}\n"
-    report += f"RSI_14: {latest.get('RSI_14', 0):.2f}\n"
+    # --- 2. Calculate Momentum and Price Action Metrics ---
+    
+    # Last 3 candles for momentum check
+    last_3_candles = df_slice.tail(3)
+    net_momentum = (last_3_candles['close'] - last_3_candles['open']).sum()
+    last_candle_type = "BULLISH (Close > Open)" if latest['close'] > latest['open'] else "BEARISH (Close < Open)"
+    
+    # Volatility Check
+    atr_14 = ta.atr(df_slice['high'], df_slice['low'], df_slice['close'], length=14).iloc[-1]
+    
+    # --- 3. Generate Explicit Signals ---
+    
+    # Trend Status
+    ema_20 = latest.get('EMA_20', 0)
+    ema_50 = latest.get('EMA_50', 0)
+    if ema_20 > ema_50:
+        trend_status = f"BULLISH (EMA20 {ema_20:.4f} > EMA50 {ema_50:.4f})"
+    elif ema_20 < ema_50:
+        trend_status = f"BEARISH (EMA20 {ema_20:.4f} < EMA50 {ema_50:.4f})"
+    else:
+        trend_status = "RANGING/FLAT"
+
+    # Overbought/Oversold Check
+    rsi_14 = latest.get('RSI_14', 50)
+    oversold_overbought = "OVERBOUGHT (RSI > 70)" if rsi_14 > 70 else ("OVERSOLD (RSI < 30)" if rsi_14 < 30 else "NEUTRAL")
+
+    
+    # --- 4. Build the Report ---
+
+    report += "### 1. Key Indicator Status\n"
+    report += f"- Primary Trend (EMA 20/50): {trend_status}\n"
+    report += f"- Momentum Status (RSI): {oversold_overbought}\n"
+    report += f"- Trend Strength (ADX): {latest.get('ADX_14', 0):.2f}\n"
+    report += f"- Volatility (ATR): {atr_14:.4f}\n"
+
+    report += "\n### 2. Immediate Price Action\n"
+    report += f"- Last Candle Type: {last_candle_type}\n"
+    report += f"- Net 3-Candle Momentum: {net_momentum:.4f}\n"
+    report += f"- MACD Histogram: {latest.get('MACDH_12_26_9', 0):.4f}\n"
+    
     return report
 
 # def get_backtest_gemini_decision(analysis_data, position_data, current_equity):
@@ -268,7 +398,12 @@ def run_backtest(historical_data, sim_exchange):
         current_candle = current_data_slice.iloc[-1]
         current_price = current_candle['close']
         
-        # --- A. Check for SL/TP Triggers ---
+        # --- A. DEFINE CONTEXT ON EVERY CANDLE ---
+        analysis_bundle = create_backtest_analysis_bundle(current_data_slice.copy()) 
+        pos = sim_exchange.get_current_position()
+        position_status_report = f"Position: {pos['side'] or 'FLAT'}, Size: {pos['quantity']:.3f}, Entry: {pos['entry_price']:.4f}"
+
+        # --- B. Check for SL/TP Triggers (Existing logic remains) ---
         pos = sim_exchange.get_current_position()
         if pos['side'] == 'LONG':
             if current_candle['low'] <= pos['stop_loss']:
@@ -289,42 +424,82 @@ def run_backtest(historical_data, sim_exchange):
                 sim_exchange.record_equity(current_candle.name, pos['take_profit'])
                 continue
         
-        # --- B. Call AI for a Decision (e.g., once every 3 candles to save API calls) ---
-        if i % 3 == 0: 
-            print(f"\n--- Candle {i} | Time: {current_candle.name} | Price: {current_price:.4f} ---")
-            analysis_bundle = create_backtest_analysis_bundle(current_data_slice.copy()) # Use copy to avoid SettingWithCopyWarning
-            position_status_report = f"Position: {pos['side'] or 'FLAT'}, Size: {pos['quantity']:.3f}, Entry: {pos['entry_price']:.4f}"
+        # --- C. Check for ACTIVE WAIT Trigger ---
+        
+        # 1. FIX: Initialize is_triggered to False
+        is_triggered = False 
+        
+        wait_price = sim_exchange.wait_condition['trigger_price']
+        wait_direction = sim_exchange.wait_condition['trigger_direction']
+        
+        if wait_price and wait_direction:
             
-            # --- MODIFICATION ---
-            # Call the unified function with the correct arguments
+            # 2. Check if the candle's low crossed BELOW the trigger price
+            if wait_direction == 'BELOW' and current_candle['low'] <= wait_price:
+                is_triggered = True
+                print(f"🎯 WAIT TRIGGER MET: Price crossed BELOW {wait_price:.4f} @ {current_candle.name}")
+                
+            # 3. Check if the candle's high crossed ABOVE the trigger price
+            elif wait_direction == 'ABOVE' and current_candle['high'] >= wait_price:
+                is_triggered = True
+                print(f"🎯 WAIT TRIGGER MET: Price crossed ABOVE {wait_price:.4f} @ {current_candle.name}")
+                
+            if is_triggered:
+                # Clear the wait condition and force a new, immediate AI analysis
+                sim_exchange.wait_condition = {"trigger_price": None, "trigger_direction": None, "action_on_trigger": None}
+        
+        # --- D. Call AI for a Decision ---
+        
+        is_scheduled_call = (i % 3 == 0)
+        
+        # 4. This line now works because is_triggered is always defined.
+        is_forced_call = is_triggered 
+
+        if is_scheduled_call or is_forced_call:
+            
+            print(f"\n--- Candle {i} | Time: {current_candle.name} | Price: {current_price:.4f} ---")
+            
             current_sim_equity = sim_exchange.get_total_equity(current_price)
-            decision, _ = get_gemini_decision(
+            decision, _ = get_ai_decision(
                 analysis_bundle, 
                 position_status_report,
-                "Backtesting session - no context.", # Context is less important in backtest
-                current_sim_equity # Pass the simulated equity here
+                "Backtesting session - no context.", 
+                current_sim_equity
             )
-            # --- END MODIFICATION ---
             
             if decision:
                 action = decision.get('action')
                 print(f"🧠 AI Decision Received: {decision}")
+                
                 if action == 'OPEN_POSITION' and not pos['side']:
+                    # Execute trade logic
                     sim_exchange.open_position(decision.get('decision'), current_candle['open'], decision)
+                    
                 elif action == 'CLOSE_POSITION' and pos['side']:
-                    sim_exchange.close_position(current_price)
+                    # Execute close logic
+                    sim_exchange.close_position(current_candle['close'], "AI CLOSE")
+                    
+                elif action == 'WAIT':
+                    # If the AI decides to WAIT, store the trigger for the next candles to check
+                    if decision.get('trigger_price'):
+                        sim_exchange.wait_condition['trigger_price'] = decision.get('trigger_price')
+                        sim_exchange.wait_condition['trigger_direction'] = decision.get('trigger_direction')
+                        print(f"💤 Setting active WAIT: {decision['trigger_direction']} {decision['trigger_price']}")
 
-        # --- C. Record Equity at the end of every candle ---
+
+        # --- E. Record Equity at the end of every candle ---
         sim_exchange.record_equity(current_candle.name, current_price)
-
+        
+        # Update the status.json for the live dashboard
+        save_backtest_status(sim_exchange, current_candle.name, current_price, 'SOLUSDT')
 
 # --- 5. Main Execution Block ---
 
 if __name__ == '__main__':
     # Define backtest parameters here
     backtest_symbol = "SOLUSDT"
-    start_date = "10 October, 2025"
-    end_date = "20 October, 2025" # A shorter period is better for initial tests due to API call speed
+    start_date = "17 October, 2025"
+    end_date = "18 October, 2025" # A shorter period is better for initial tests due to API call speed
     
     # 1. Download data
     hist_data = get_historical_data(

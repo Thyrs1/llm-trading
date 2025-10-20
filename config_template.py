@@ -11,9 +11,14 @@ GEMINI_API_KEYS = [
     "",
     "", # Add more if needed
     "",
+    "-",
+    "",
+    "",
+    "-",
+    ""
 ]
 
-TELEGRAM_BOT_TOKEN = ""
+TELEGRAM_BOT_TOKEN = ":-"
 TELEGRAM_CHAT_ID = ""
 CRYPTOPANIC_API_KEY = ""
 
@@ -27,7 +32,7 @@ MAX_RISK_PER_TRADE = 0.90 # 10%
 
 # --- Trading Parameters ---
 SYMBOL = "SOLUSDT"
-ANALYSIS_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h'] # Focus on shorter timeframes
+ANALYSIS_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d'] # Focus on shorter timeframes
 
 # --- Bot Logic Parameters ---
 # Default interval (in seconds) for Gemini to be called if no specific trigger is set.

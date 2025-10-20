@@ -31,6 +31,9 @@ import requests, feedparser, re
 from bs4 import BeautifulSoup
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 
+# --- NEW OPENAI/DEEPSEEK IMPORTS ---
+from openai import OpenAI
+from openai import APIStatusError, APITimeoutError # New error types
 
 # --- 1. State Management ---
 class BotState(Enum):
@@ -40,9 +43,15 @@ class BotState(Enum):
     IN_POSITION = 4
     COOL_DOWN = 5
 
-bot_status = { "bot_state": "INITIALIZING", "symbol": config.SYMBOL, "position": {"side": None, "quantity": 0, "entry_price": 0}, "pnl": {"usd": None, "percentage": 0}, "last_gemini_decision": None, "log": deque(maxlen=30), "last_update": None, }
+bot_status = { "bot_state": "INITIALIZING", 
+              "symbol": config.SYMBOL, 
+              "position": {"side": None, 
+                           "quantity": 0, 
+                           "entry_price": 0}, 
+              "pnl": {"usd": None, "percentage": 0}, 
+              "last_ai_decision": None, "log": deque(maxlen=30), "last_update": None, }
 current_bot_state = BotState.SEARCHING
-last_gemini_decision = {}
+last_ai_decision = {}
 current_key_index = 0
 price_precision = 2
 quantity_precision = 2
@@ -104,7 +113,6 @@ def get_news_from_rss(symbol: str, limit=15):
     add_log("📰 Fetching and filtering news from RSS feeds...")
     
     rss_feeds = [
-        "https://cointelegraph.com/rss/tag/solana", # Example of a symbol-specific feed
         "https://cointelegraph.com/rss",
         "https://www.coindesk.com/arc/outboundfeeds/rss/",
         # Add more general crypto news feeds here
@@ -169,15 +177,31 @@ except Exception as e:
     add_log(f"❌ Binance initialization failed: {e}")
     exit()
 
+# try:
+#     gemini_model = genai.GenerativeModel('gemini-flash-latest') # Using the latest flash model
+#     add_log(f"✅ Gemini AI model loaded. Using {len(config.GEMINI_API_KEYS)} API keys for rotation.")
+# except Exception as e:
+#     add_log(f"❌ Gemini AI initialization failed: {e}")
+#     exit()
+
 try:
-    gemini_model = genai.GenerativeModel('gemini-flash-latest') # Using the latest flash model
-    add_log(f"✅ Gemini AI model loaded. Using {len(config.GEMINI_API_KEYS)} API keys for rotation.")
+    add_log("🤖 Initializing OpenAI/DeepSeek client...")
+    client = OpenAI(
+        api_key=config.DEEPSEEK_API_KEY,
+        base_url=config.DEEPSEEK_BASE_URL,
+        temperature=0.3
+    )
+    client.models_lists()  # Test call to ensure client works
+    add_log("✅ OpenAI/DeepSeek client initialized successfully.")
+    
+    AI_MODEL_NAME = "deepseek-reasoner"
+    
 except Exception as e:
-    add_log(f"❌ Gemini AI initialization failed: {e}")
+    add_log(f"❌ OpenAI/DeepSeek initialization failed: {e}")
     exit()
 
-# --- 4. Gemini Master Prompt ---
-GEMINI_SYSTEM_PROMPT_TEXT_BASED = """
+# --- 4. AI Model Master Prompt ---
+AI_SYSTEM_PROMPT_TEXT_BASED = """
 **PERSONA: 'THE FINISHER'**
 
 You are 'The Finisher', an elite momentum and trend-continuation trader. Your strategy is to identify an established trend on a medium timeframe (15m or 1h) and then execute surgically precise entries on lower timeframes (1m, 5m) to capture the most explosive part of the move. You are aggressive in execution but disciplined in risk. Your goal is to achieve a high win rate on high-momentum trades, cutting losses instantly if the momentum fades.
@@ -191,7 +215,7 @@ You are 'The Finisher', an elite momentum and trend-continuation trader. Your st
 3.  **EXECUTE AGGRESSIVELY (THE FINISH):** When the price pulls back to your entry zone and shows signs of resuming the trend, you execute. Your confidence should be `high`. We are not interested in `medium` or `low` confidence setups. If it's not an A+ setup, you `WAIT`.
 
 4.  **DEFINED RISK/REWARD PROFILE:**
-    *   **Risk/Reward Ratio:** Your `TAKE_PROFIT` must be at least **1.75 times** further from your `ENTRY_PRICE` than your `STOP_LOSS`.
+    *   **Risk/Reward Ratio:** Your `TAKE_PROFIT` must be at least **2.75 times** further from your `ENTRY_PRICE` than your `STOP_LOSS`.
     *   **Stop Loss Placement:** Your `STOP_LOSS` must be placed logically just below the recent swing low (for a long) or above the swing high (for a short) of the pullback. It should be tight, but not so tight that market noise stops you out.
     *   **Risk Percentage (`RISK_PERCENT`):** Your risk is dynamic based on confidence. For your standard `high` confidence trade, use between **4% and 8%** risk. If you have extreme conviction (e.g., a major technical breakout confirmed by strong news sentiment), you can go up to **15%**.
 
@@ -256,7 +280,7 @@ Now, analyze the following data and provide your full response.
 """
 def is_decision_sane(decision):
     """
-    Performs a sanity check on the prices provided by Gemini to prevent hallucinations.
+    Performs a sanity check on the prices provided by AI Model to prevent hallucinations.
     """
     try:
         # Get the current mark price for comparison
@@ -299,11 +323,11 @@ def is_decision_sane(decision):
 
 def run_diagnostic_query(analysis_data, position_data):
     """
-    Asks Gemini to "think out loud" in plain English without JSON constraints.
+    Asks AI Model to "think out loud" in plain English without JSON constraints.
     This is used to diagnose why it might be generating faulty data.
     """
     global current_key_index
-    add_log("--- 🧠 Requesting Gemini RAW THOUGHT PROCESS for diagnostics ---")
+    add_log("--- 🧠 Requesting AI Model RAW THOUGHT PROCESS for diagnostics ---")
     
     # A different, more open-ended prompt
     diagnostic_prompt = f"""
@@ -328,28 +352,28 @@ def run_diagnostic_query(analysis_data, position_data):
     {analysis_data}
     """
     
-    # This loop is for a single, non-structured request
-    for i in range(len(config.GEMINI_API_KEYS)):
-        try:
-            key = config.GEMINI_API_KEYS[current_key_index]
-            # Create a fresh, temporary model instance
-            genai.configure(api_key=key) # type: ignore
-            model = genai.GenerativeModel('gemini-flash-latest') # type: ignore
-            current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
+    # # This loop is for a single, non-structured request
+    # for i in range(len(config.GEMINI_API_KEYS)):
+    #     try:
+    #         key = config.GEMINI_API_KEYS[current_key_index]
+    #         # Create a fresh, temporary model instance
+    #         genai.configure(api_key=key) # type: ignore
+    #         model = genai.GenerativeModel('gemini-flash-latest') # type: ignore
+    #         current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
             
-            # Make a standard text-only API call
-            response = model.generate_content(diagnostic_prompt)
+    #         # Make a standard text-only API call
+    #         response = model.generate_content(diagnostic_prompt)
             
-            return response.text # Return the plain text response
+    #         return response.text # Return the plain text response
             
-        except exceptions.ResourceExhausted:
-            add_log(f"⚠️ Gemini API key at index {current_key_index-1} is rate-limited. Switching...")
-            continue
-        except Exception as e:
-            add_log(f"❌ Error during diagnostic query: {e}")
-            return f"Failed to get diagnostic response: {e}"
+    #     except exceptions.ResourceExhausted:
+    #         add_log(f"⚠️ Gemini API key at index {current_key_index-1} is rate-limited. Switching...")
+    #         continue
+    #     except Exception as e:
+    #         add_log(f"❌ Error during diagnostic query: {e}")
+    #         return f"Failed to get diagnostic response: {e}"
 
-    return "All Gemini API keys failed during diagnostic query."
+    # return "All Gemini API keys failed during diagnostic query."
 
 # --- 5. Data Acquisition and Analysis Functions ---
 def get_klines_robust(symbol, interval, limit=200, retries=3, delay=5):
@@ -436,8 +460,8 @@ def run_heavy_analysis():
 
     for tf in config.ANALYSIS_TIMEFRAMES:
         # --- CRITICAL FIX: Fetch more data to ensure indicators can warm up ---
-        # We need at least 200 candles for the EMA_200, so fetching 300 gives a buffer.
-        df = get_klines_robust(config.SYMBOL, tf, limit=300)
+        # We need at least 200 candles for the EMA_200, so fetching 250 gives a buffer.
+        df = get_klines_robust(config.SYMBOL, tf, limit=250)
         if df is None: continue
         
         # Explicitly name the indicator columns
@@ -551,38 +575,48 @@ def parse_context_block(raw_text: str) -> dict:
 # --- 6. AI Interaction and Learning ---
 
 def summarize_and_learn(trade_history_entry: str):
-    """Asks Gemini to analyze a closed trade, extract a lesson, and update the memory file."""
+    """Asks AI to analyze a closed trade, extract a lesson, and update the memory file."""
     global current_key_index
     add_log("🧠 Performing post-trade analysis to update memory...")
-    memory_prompt = f"""You are a master trading analyst. Your goal is to learn from every trade. Below is the data for a recently closed trade.
+    system_prompt = "You are a master trading analyst. Your goal is to learn from every trade."
+    memory_prompt = f""" Below is the data for a recently closed trade.
     **Trade Data:**\n{trade_history_entry}
     **Your Task:** Analyze this trade. Was it a good entry? Was the outcome due to a good strategy or just luck? Condense your analysis into a single, powerful, one-sentence "lesson learned" starting with "Lesson:".
     **Example Lessons:**
     - "Lesson: Shorting into a strong 15m uptrend, even with a high L/S ratio, is risky and often results in being stopped out."
     - "Lesson: Entering a long position near the 1h EMA50 after a period of consolidation has a high probability of success."
     Provide only the single "Lesson:" line."""
-    for i in range(len(config.GEMINI_API_KEYS)):
-        try:
-            key = config.GEMINI_API_KEYS[current_key_index]
-            genai.configure(api_key=key)
-            model = genai.GenerativeModel('gemini-flash-latest')
-            current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
-            response = model.generate_content(memory_prompt)
-            lesson = response.text.strip()
-            if "Lesson:" in lesson:
-                add_log(f"💡 New lesson learned: {lesson}")
-                with open("trade_memory.txt", "a") as f:
-                    f.write(f"- {lesson}\n")
-                return
-            else:
-                add_log("⚠️ Could not extract a valid lesson from the trade analysis.")
-        except Exception as e:
-            add_log(f"❌ Error during trade summarization on key index {current_key_index-1}: {e}")
+
+    try:
+        key = config.DEEPSEEK_API_KEY[current_key_index]
+        client = OpenAI(
+            api_key=key,
+            base_url=config.DEEPSEEK_BASE_URL,
+            temperature=0.3
+        )
+        add_log(f"🧠 Requesting trade summarization from DeepSeek with key index")
+        response = client.chat.completions.create(
+            model=AI_MODEL_NAME,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": memory_prompt}
+            ]
+        )
+        lesson = response.text.strip()
+        if "Lesson:" in lesson:
+            add_log(f"💡 New lesson learned: {lesson}")
+            with open("trade_memory.txt", "a") as f:
+                f.write(f"- {lesson}\n")
+            return
+        else:
+                    add_log("⚠️ Could not extract a valid lesson from the trade analysis.")
+    except Exception as e:
+               add_log(f"❌ Error during trade summarization on key index {current_key_index-1}: {e}")
     add_log("🚨 All API keys failed during trade summarization.")
 
 
-def get_gemini_decision(analysis_data, position_data, last_context_summary, live_equity):
-    """Gets a trading decision from Gemini, including long-term memory."""
+def get_ai_decision(analysis_data, position_data, last_context_summary, live_equity):
+    """Gets a trading decision from AI Models, including long-term memory."""
     global current_key_index
     try:
         with open("trade_memory.txt", "r") as f:
@@ -592,7 +626,7 @@ def get_gemini_decision(analysis_data, position_data, last_context_summary, live
 
     # live_equity = get_total_equity()
 
-    prompt = f"""{GEMINI_SYSTEM_PROMPT_TEXT_BASED}
+    prompt = f"""
     
 **--- CRITICAL ACCOUNT CONSTRAINTS ---**
 My current account equity is only ${live_equity:.2f} USDT. You MUST provide parameters that are realistic for this small account size. A large position with a tight stop-loss may be impossible to open due to margin requirements. Be pragmatic.
@@ -610,35 +644,38 @@ My current account equity is only ${live_equity:.2f} USDT. You MUST provide para
 **2. Holographic Market Analysis:**
 {analysis_data}
 Based on your memory, your last analysis, and the new data, provide your full response."""
-    for i in range(len(config.GEMINI_API_KEYS)):
-        try:
-            key = config.GEMINI_API_KEYS[current_key_index]
-            add_log(f"🧠 Requesting text-based decision from Gemini with key index {current_key_index}...")
-            genai.configure(api_key=key)
-            model = genai.GenerativeModel('gemini-flash-latest')
-            current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
-            response = model.generate_content(prompt, generation_config={"temperature": 0})
-            raw_response_text = response.text
-            add_log("--- 🧠 GEMINI RAW TEXT RESPONSE ---"); add_log(raw_response_text); add_log("--- END RAW TEXT RESPONSE ---")
+    try:
+        key = config.DEEPSEEK_API_KEY
+        add_log(f"🧠 Requesting text-based decision from OpenAI/Deepseek")
+        genai.configure(api_key=key)
+        client = OpenAI(
+            api_key=key,
+            base_url=config.DEEPSEEK_BASE_URL,
+            temperature=0.3
+        )
+        response = client.chat.completions.create(
+            model=AI_MODEL_NAME,
+            messages=[
+                {"role": "system", "content": AI_SYSTEM_PROMPT_TEXT_BASED},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        raw_response_text = response.text
+        add_log("--- 🧠 AI MODEL RAW TEXT RESPONSE ---"); add_log(raw_response_text); add_log("--- END RAW TEXT RESPONSE ---")
             
-            decision_dict = parse_decision_block(raw_response_text)
-            context_dict = parse_context_block(raw_response_text)
+        decision_dict = parse_decision_block(raw_response_text)
+        context_dict = parse_context_block(raw_response_text)
             
-            if not decision_dict or 'action' not in decision_dict:
-                add_log("❌ Parsing failed or ACTION key is missing. Trying next key.")
-                continue
-            if context_dict:
-                save_market_context(context_dict)
-            add_log(f"✅ Gemini decision parsed. Action: {decision_dict.get('action')}")
-            return decision_dict, context_dict
-        except exceptions.ResourceExhausted:
-            add_log(f"⚠️ Gemini API key at index {current_key_index-1} is rate-limited. Switching...")
-            continue
-        except Exception as e:
-            add_log(f"❌ An unexpected error during Gemini call: {traceback.format_exc()}")
-    add_log("🚨 All Gemini API keys failed. Pausing.")
-    time.sleep(60)
-    return None, None
+        if not decision_dict or 'action' not in decision_dict:
+            add_log("❌ Parsing failed or ACTION key is missing.")
+        if context_dict:
+            save_market_context(context_dict)
+        add_log(f"✅ AI Model decision parsed. Action: {decision_dict.get('action')}")
+        return decision_dict, context_dict
+    except exceptions.ResourceExhausted:
+        add_log(f"⚠️ OpenAI/Deepseek API key is rate-limited.")
+    except Exception as e:
+        add_log(f"❌ An unexpected error during OpenAI API call: {traceback.format_exc()}")
 
 # --- 7. Trading Execution and Management Functions ---
 def get_current_position():
@@ -725,7 +762,7 @@ def open_position(decision):
     risk_percent = decision.get('risk_percent')
     
     if not all([side, entry_price, stop_loss_price, leverage, risk_percent is not None]):
-        add_log(f"❌ Gemini OPEN decision missing required fields. Decision: {decision}")
+        add_log(f"❌ AI OPEN decision missing required fields. Decision: {decision}")
         return
 
     # Calculate the desired position size based on risk
@@ -783,7 +820,7 @@ def open_position(decision):
         add_log(f"❌ Binance order failed: {e}")
 
 def close_position(position):
-    add_log(f"Executing Gemini's instruction to CLOSE position...")
+    add_log(f"Executing AI's instruction to CLOSE position...")
     try:
         binance_client.futures_cancel_all_open_orders(symbol=config.SYMBOL)
         close_side = 'BUY' if position['side'] == 'SHORT' else 'SELL'
@@ -794,7 +831,7 @@ def close_position(position):
 
 def modify_position(decision, position):
     """Modifies the Stop Loss and/or Take Profit with correct precision."""
-    add_log(f"Executing Gemini's instruction to MODIFY position...")
+    add_log(f"Executing AI's instruction to MODIFY position...")
     try:
         binance_client.futures_cancel_all_open_orders(symbol=config.SYMBOL)
         sl_price = decision.get('new_stop_loss')
@@ -825,7 +862,7 @@ def modify_position(decision, position):
         add_log(f"❌ Failed to modify position: {e}")
 
 def wait_for_trigger(decision):
-    """Enters a fast loop to check for a specific condition set by Gemini."""
+    """Enters a fast loop to check for a specific condition set by AI."""
     # --- MODIFICATION START ---
     # Get parameters directly, matching the new robust logic.
     price = decision.get('trigger_price')
@@ -834,7 +871,7 @@ def wait_for_trigger(decision):
     
     # Simplified, robust check for valid parameters.
     if not all([price, direction]) or price <= 0:
-        add_log("⚠️ Gemini WAIT decision missing valid trigger parameters. Re-analyzing immediately.")
+        add_log("⚠️ AI WAIT decision missing valid trigger parameters. Re-analyzing immediately.")
         return
     # --- MODIFICATION END ---
 
@@ -863,7 +900,7 @@ def wait_for_trigger(decision):
     add_log(f"⏳ Wait condition timed out after {timeout_seconds} seconds. Re-analyzing.")
 
 def close_position(position):
-    add_log(f"Executing Gemini's instruction to CLOSE position...")
+    add_log(f"Executing AI's instruction to CLOSE position...")
     try:
         binance_client.futures_cancel_all_open_orders(symbol=config.SYMBOL)
         close_side = 'BUY' if position['side'] == 'SHORT' else 'SELL'
@@ -874,7 +911,7 @@ def close_position(position):
 
 # --- 8. Main Loop ---
 def main_loop():
-    global bot_status, last_gemini_decision
+    global bot_status, last_ai_decision
     add_log("🤖 AI-Driven Trading Bot Main Loop Started.")
     
     was_in_position = False
@@ -899,7 +936,7 @@ def main_loop():
                                          f"Entry Price: {last_position_details.get('entry_price', 'N/A')}\n"
                                          f"Closing Price: {float(closing_trade['price']):.4f}\n"
                                          f"Realized PNL (USDT): {pnl:.4f}\n"
-                                         f"Reason for Entry: {last_gemini_decision.get('reasoning', 'N/A')}\n"
+                                         f"Reason for Entry: {last_ai_decision.get('reasoning', 'N/A')}\n"
                                          f"Closing Reason: Automatically closed by SL/TP or external action.\n")
                         summarize_and_learn(trade_summary)
                     else:
@@ -924,7 +961,7 @@ def main_loop():
                 context_summary = "No market context from previous sessions is available."
             
             current_live_equity = get_total_equity()
-            decision, new_context = get_gemini_decision(analysis_bundle, position_status_report, context_summary, current_live_equity)
+            decision, new_context = get_ai_decision(analysis_bundle, position_status_report, context_summary, current_live_equity)
             
             if new_context:
                 market_context = new_context
@@ -932,23 +969,23 @@ def main_loop():
             if not decision:
                 time.sleep(60); continue
             
-            bot_status['last_gemini_decision'] = decision
-            last_gemini_decision = decision
+            bot_status['last_ai_decision'] = decision
+            last_ai_decision = decision
             
             if not is_decision_sane(decision):
                 add_log("🚨 SANITY CHECK FAILED. Aborting action.")
                 time.sleep(60); continue
             
-            add_log(f"💡 Gemini Action Plan: {decision.get('action')}. Reason: {decision.get('reasoning')}")
+            add_log(f"💡 AI Action Plan: {decision.get('action')}. Reason: {decision.get('reasoning')}")
             action = decision.get('action')
             
             if action == 'OPEN_POSITION':
                 if pos['side']:
-                    add_log("⚠️ Gemini wants to open but already in position. Holding.")
+                    add_log("⚠️ AI wants to open but already in position. Holding.")
                 else:
                     confidence = decision.get('confidence')
                     if confidence == 'low':
-                        add_log(f"📉 SKIPPING TRADE: Gemini's confidence is LOW.")
+                        add_log(f"📉 SKIPPING TRADE: AI's confidence is LOW.")
                     elif confidence in ['medium', 'high']:
                         add_log(f"🔥 Executing trade with {confidence.upper()} confidence.")
                         open_position(decision)
@@ -957,11 +994,11 @@ def main_loop():
             
             elif action == 'CLOSE_POSITION':
                 if pos['side']: close_position(pos)
-                else: add_log("⚠️ Gemini wants to close but position is already flat.")
+                else: add_log("⚠️ AI wants to close but position is already flat.")
             
             elif action == 'MODIFY_POSITION':
                 if pos['side']: modify_position(decision, pos)
-                else: add_log("⚠️ Gemini wants to modify but position is flat.")
+                else: add_log("⚠️ AI wants to modify but position is flat.")
 
             elif action == 'WAIT':
                 trigger_price = decision.get('trigger_price')
@@ -970,10 +1007,10 @@ def main_loop():
                     add_log("Trigger conditions found, entering fast-check wait mode.")
                     wait_for_trigger(decision)
                 else:
-                    add_log(f"Gemini instructed to wait without a specific trigger. Monitoring continuously...")
+                    add_log(f"AI instructed to wait without a specific trigger. Monitoring continuously...")
             
             else:
-                add_log(f"Unknown action from Gemini: {action}. Waiting.")
+                add_log(f"Unknown action from AI: {action}. Waiting.")
             
             # Default sleep interval after an action
             time.sleep(config.DEFAULT_MONITORING_INTERVAL)
