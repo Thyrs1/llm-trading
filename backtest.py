@@ -50,7 +50,6 @@ try:
     ai_client = OpenAI(
         api_key=config.DEEPSEEK_API_KEY,
         base_url=config.DEEPSEEK_BASE_URL, # Use the DeepSeek URL
-        temperature=0.3
     )
     # Ping the service just to verify connectivity (optional, but good practice)
     ai_client.models.list() 

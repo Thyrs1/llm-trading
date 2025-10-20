@@ -189,7 +189,6 @@ try:
     client = OpenAI(
         api_key=config.DEEPSEEK_API_KEY,
         base_url=config.DEEPSEEK_BASE_URL,
-        temperature=0.3
     )
     client.models_lists()  # Test call to ensure client works
     add_log("✅ OpenAI/DeepSeek client initialized successfully.")
@@ -592,7 +591,6 @@ def summarize_and_learn(trade_history_entry: str):
         client = OpenAI(
             api_key=key,
             base_url=config.DEEPSEEK_BASE_URL,
-            temperature=0.3
         )
         add_log(f"🧠 Requesting trade summarization from DeepSeek with key index")
         response = client.chat.completions.create(
@@ -600,7 +598,8 @@ def summarize_and_learn(trade_history_entry: str):
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": memory_prompt}
-            ]
+            ],
+            temperature=0.3
         )
         lesson = response.text.strip()
         if "Lesson:" in lesson:
@@ -651,14 +650,14 @@ Based on your memory, your last analysis, and the new data, provide your full re
         client = OpenAI(
             api_key=key,
             base_url=config.DEEPSEEK_BASE_URL,
-            temperature=0.3
         )
         response = client.chat.completions.create(
             model=AI_MODEL_NAME,
             messages=[
                 {"role": "system", "content": AI_SYSTEM_PROMPT_TEXT_BASED},
                 {"role": "user", "content": prompt}
-            ]
+            ],
+            temperature=0.3
         )
         raw_response_text = response.text
         add_log("--- 🧠 AI MODEL RAW TEXT RESPONSE ---"); add_log(raw_response_text); add_log("--- END RAW TEXT RESPONSE ---")
