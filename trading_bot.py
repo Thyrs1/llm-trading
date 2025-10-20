@@ -1,4 +1,4 @@
-# trading_bot.py (v12 - With AI Memory Refresh)
+# trading_bot.py (v13 - Fully Integrated Memory and Learning)
 
 # --- Standard Library Imports ---
 import os
@@ -16,7 +16,6 @@ import pandas as pd
 import pandas_ta as ta
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-from pydantic import BaseModel, Field
 
 # Correct, modern imports for Google GenAI SDK
 import google.generativeai as genai
@@ -25,6 +24,13 @@ from google.api_core import exceptions
 
 # --- Local Imports ---
 import config
+
+# NEW LOGIC FOR FINBERT IMPLEMENTATION
+
+import requests
+from bs4 import BeautifulSoup
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+
 
 # --- 1. State Management ---
 class BotState(Enum):
@@ -37,12 +43,9 @@ class BotState(Enum):
 bot_status = { "bot_state": "INITIALIZING", "symbol": config.SYMBOL, "position": {"side": None, "quantity": 0, "entry_price": 0}, "pnl": {"usd": None, "percentage": 0}, "last_gemini_decision": None, "log": deque(maxlen=30), "last_update": None, }
 current_bot_state = BotState.SEARCHING
 last_gemini_decision = {}
-pending_order_id = None
-pending_order_start_time = 0
 current_key_index = 0
-# --- NEW: Global variables for exchange precision rules ---
-price_precision = 2  # Default, will be updated on startup
-quantity_precision = 2 # Default, will be updated on startup
+price_precision = 2
+quantity_precision = 2
 
 # --- 2. Utility Functions ---
 def save_status():
@@ -61,7 +64,92 @@ def add_log(message):
     print(log_entry)
     save_status()
 
+
+
+# Initialize the model once to avoid reloading it every time
+try:
+    add_log("🤖 Loading FinBERT sentiment model...")
+    tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+    model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+    sentiment_analyzer = pipeline("sentiment-analysis", model=model, tokenizer=tokenizer)
+    add_log("✅ FinBERT model loaded successfully.")
+except Exception as e:
+    add_log(f"❌ CRITICAL: Could not load FinBERT model: {e}. Sentiment analysis will be disabled.")
+    sentiment_analyzer = None
+
+def get_sentiment_score(text: str) -> float:
+    """Analyzes text using FinBERT and returns a single numerical score."""
+    if not sentiment_analyzer or not text or "failed" in text or "Could not" in text:
+        return 0.0 # Return neutral if the model or text is unavailable
+
+    try:
+        results = sentiment_analyzer(text)
+        # Convert 'positive', 'negative', 'neutral' to a numerical score.
+        # Example logic: positive is +score, negative is -score.
+        score = 0.0
+        for res in results:
+            if res['label'] == 'positive':
+                score += res['score']
+            elif res['label'] == 'negative':
+                score -= res['score']
+        # Normalize the score to be between -1 and 1
+        return round(max(-1.0, min(1.0, score / len(results))), 2) if results else 0.0
+    except Exception as e:
+        add_log(f"❌ Error during sentiment analysis: {e}")
+        return 0.0 # Return neutral on error
+
+    
+def get_news_from_cryptopanic_api(symbol='SOL', limit=10):
+    """
+    Fetches news headlines for a specific currency using the CryptoPanic API.
+    Returns a single string of concatenated headlines.
+    """
+    if not config.CRYPTOPANIC_API_KEY or config.CRYPTOPANIC_API_KEY == "paste_your_actual_api_key_here":
+        add_log("⚠️ CryptoPanic API key not configured. Skipping news fetch.")
+        return "News API not configured."
+
+    add_log(f"📰 Fetching news for {symbol} from CryptoPanic API...")
+    
+    # API endpoint URL
+    url = "https://cryptopanic.com/api/v1/posts/"
+    
+    # Parameters for the API request
+    params = {
+        "auth_token": config.CRYPTOPANIC_API_KEY,
+        "currencies": symbol,  # Filter news for our specific symbol
+        "public": "true"
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=10) # Added a timeout
+        
+        # Check if the request was successful
+        if response.status_code == 200:
+            data = response.json()
+            # Extract just the titles from the news posts
+            headlines = [post['title'] for post in data['results']]
+            
+            if not headlines:
+                add_log("No recent news found for the symbol.")
+                return "No recent news found."
+            
+            # Join the headlines into a single text block for FinBERT
+            return ". ".join(headlines[:limit])
+        else:
+            # Handle potential API errors
+            error_message = f"CryptoPanic API Error {response.status_code}: {response.text}"
+            add_log(f"❌ {error_message}")
+            return f"API Error: {response.status_code}"
+
+    except requests.exceptions.RequestException as e:
+        add_log(f"❌ Network error while fetching news from CryptoPanic: {e}")
+        return "News fetching failed due to network error."
+    except Exception as e:
+        add_log(f"❌ An unexpected error occurred during news fetch: {e}")
+        return "News fetching failed."
+
 # --- 3. API Client Initialization ---
+# (This section is correct and remains unchanged)
 FUTURES_TESTNET_URL = "https://testnet.binancefuture.com"
 try:
     add_log("Initializing Binance client...")
@@ -83,195 +171,90 @@ try:
     exchange_info = binance_client.futures_exchange_info()
     for s in exchange_info['symbols']:
         if s['symbol'] == config.SYMBOL:
-            price_precision = 2
-            quantity_precision = 2
+            price_precision = int(s['pricePrecision'])
+            quantity_precision = int(s['quantityPrecision'])
             add_log(f"✅ Precision rules for {config.SYMBOL}: Price={price_precision}, Quantity={quantity_precision}")
             break
-
 except Exception as e:
     add_log(f"❌ Binance initialization failed: {e}")
     exit()
 
 try:
-    gemini_model = genai.GenerativeModel('gemini-flash-latest') # type: ignore
+    gemini_model = genai.GenerativeModel('gemini-2.5-pro') # Using the latest flash model
     add_log(f"✅ Gemini AI model loaded. Using {len(config.GEMINI_API_KEYS)} API keys for rotation.")
 except Exception as e:
     add_log(f"❌ Gemini AI initialization failed: {e}")
     exit()
 
-# --- 4. Gemini Master Prompt (Text-Based V3) ---
-
+# --- 4. Gemini Master Prompt ---
 GEMINI_SYSTEM_PROMPT_TEXT_BASED = """
-You are 'The Scalpel', the world's #1 proprietary trader. Your analysis is final and must be communicated with absolute clarity.
+You are 'The Scalpel', the world's #1 proprietary trader. Your analysis is final and must be communicated with absolute clarity. Your persona is aggressive, disciplined, and focused on high-probability scalps.
 
 **DIRECTIVE**
-Analyze the provided market data and current position. Formulate a complete trading plan. You must output your final decision inside a special block called `[DECISION_BLOCK]`.
+Analyze the provided market data, strategic memory, and current position.
+A new data point, "News Sentiment Score", is now included. This score, from -1.0 (very negative) to +1.0 (very positive), reflects the current mood of financial news.
+Use this sentiment as a strong confirmation factor. For example, avoid taking a LONG position if sentiment is strongly negative, even if technicals look good.
+...
 
+
+#  Summary: Pros and Cons of this Hybrid Approach
+
+| Pros                                                                                                | Cons                                                                                                |
+| --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| **Much More Powerful:** Combines the best of both worlds: Gemini's reasoning + FinBERT's specialty. | **More Complex:** The script now has more moving parts and dependencies.                          |
+| **Catches News-Driven Moves:** Can react to sentiment shifts that aren't yet visible on the charts. | **Local Compute:** FinBERT runs on your machine. It can be slow without a GPU.                      |
+| **Higher Quality Signals:** Gemini can use sentiment as a filter, improving the quality of its trades. | **News Reliability:** Free web scraping is fragile. A real news API costs money.                    |
+| **Maintains Core Logic:** You don't have to rewrite your entire trading execution system.             | **Prompt Engineering:** You need to ensure Gemini understands and respects the sentiment score.    |
+
+This hybrid architecture is a massive upgrade and the correct way to incorporate a specialized model like FinBERT into a sophisticated, AI-driven trading system.
 **FORMATTING RULES FOR [DECISION_BLOCK]**
-1.  The block starts with the line `[DECISION_BLOCK]` and ends with `[END_BLOCK]`.
-2.  Inside the block, each line must be a `KEY: VALUE` pair.
-3.  **CRITICAL:** Only include the KEYs relevant to your chosen `ACTION`. Do not include keys for actions you are not taking.
+1.  Starts with `[DECISION_BLOCK]` and ends with `[END_BLOCK]`.
+2.  Inside, each line must be a `KEY: VALUE` pair.
+3.  **CRITICAL:** Only include KEYs relevant to your chosen `ACTION`.
 
 **AVAILABLE KEYS and WHEN TO USE THEM:**
-
-*   `ACTION`: (REQUIRED) The action to take. Must be one of: `OPEN_POSITION`, `CLOSE_POSITION`, `MODIFY_POSITION`, `WAIT`.
+*   `ACTION`: (REQUIRED) Must be one of: `OPEN_POSITION`, `CLOSE_POSITION`, `MODIFY_POSITION`, `WAIT`.
 *   `REASONING`: (REQUIRED) A brief, one-sentence explanation for your action.
-
-*   **--- If ACTION is `OPEN_POSITION`, you MUST also include:**
+*   **--- If ACTION is `OPEN_POSITION`:**
     *   `DECISION`: `LONG` or `SHORT`.
+    *   `CONFIDENCE`: Your confidence level. Must be one of: `high`, `medium`, `low`.
     *   `ENTRY_PRICE`: The target entry price.
     *   `STOP_LOSS`: The mandatory stop loss price.
     *   `TAKE_PROFIT`: The initial take profit price.
-    *   `LEVERAGE`: The integer leverage to use.
-    *   `RISK_PERCENT`: The percentage of capital to risk. 20.0 at minimum. 90.0 at maximum.
-
-*   **--- If ACTION is `WAIT`, you MUST also include:**
+    *   `LEVERAGE`: Integer leverage to use.
+    *   `RISK_PERCENT`: Percentage of capital to risk (Min 10%, max 90%, dont place orders for those that you dont have confidence).
+*   **--- If ACTION is `WAIT`:**
     *   `TRIGGER_PRICE`: The price that triggers the next analysis.
     *   `TRIGGER_DIRECTION`: `ABOVE` or `BELOW`.
     *   `TRIGGER_TIMEOUT`: Timeout in seconds.
+*   **--- If ACTION is `MODIFY_POSITION`:**
+    *   `NEW_STOP_LOSS`: New stop loss price. (Use 0 if not changing)
+    *   `NEW_TAKE_PROFIT`: New take profit price. (Use 0 if not changing)
 
-*   **--- If ACTION is `MODIFY_POSITION`, you MUST also include:**
-    *   `NEW_STOP_LOSS`: The new stop loss price. (Use 0 if not changing)
-    *   `NEW_TAKE_PROFIT`: The new take profit price. (Use 0 if not changing)
+**ADDITIONAL REQUIREMENT: Market Context Summary**
+After `[END_BLOCK]`, you MUST provide a `[MARKET_CONTEXT_BLOCK]`. This is your persistent view of the market.
+*   `MARKET_THESIS`: Short summary of your overall view (e.g., "Bullish but overbought", "Bearish consolidation").
+*   `KEY_SUPPORT`: Most important support price.
+*   `KEY_RESISTANCE`: Most important resistance price.
+*   `DOMINANT_TREND`: The timeframe (e.g., 1m, 5m, 15m, 1h) currently driving the price.
 
-*   **--- If ACTION is `CLOSE_POSITION`, no other keys are needed.**
-
-**EXAMPLE 1: Opening a Long Position**
-[DECISION_BLOCK]
-ACTION: OPEN_POSITION
-REASONING: The price is showing bullish momentum after breaking a key resistance level on the 15m chart.
-DECISION: LONG
-ENTRY_PRICE: 190.50
-STOP_LOSS: 189.00
-TAKE_PROFIT: 193.00
-LEVERAGE: 20
-RISK_PERCENT: 2.5
-[END_BLOCK]
-**EXAMPLE 2: Waiting for a Price Drop**
+**EXAMPLE of the full output:**
 [DECISION_BLOCK]
 ACTION: WAIT
-REASONING: The market is consolidating; waiting for a pullback to a stronger support level before considering an entry.
-TRIGGER_PRICE: 188.75
-TRIGGER_DIRECTION: BELOW
-TRIGGER_TIMEOUT: 600
+REASONING: The market is approaching a major resistance; waiting for a confirmed breakout or rejection.
+TRIGGER_PRICE: 193.20
+TRIGGER_DIRECTION: ABOVE
+TRIGGER_TIMEOUT: 900
 [END_BLOCK]
-Now, analyze the following data and provide your decision.
+[MARKET_CONTEXT_BLOCK]
+MARKET_THESIS: Bullish but overbought, approaching major 4h resistance.
+KEY_SUPPORT: 189.75
+KEY_RESISTANCE: 193.20
+DOMINANT_TREND: 15m
+[END_CONTEXT_BLOCK]
+
+Now, analyze the following data and provide your full response.
 """
-
-# --- 5. Data Acquisition and Analysis Functions ---
-def get_klines_robust(symbol, interval, limit=200, retries=3, delay=5):
-    for i in range(retries):
-        try:
-            klines = binance_client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-            columns = ['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore']
-            df = pd.DataFrame(klines, columns=columns)
-            df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
-            df = df.set_index('open_time')
-            numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'quote_asset_volume', 'taker_buy_base_asset_volume']
-            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-            return df.drop(columns=['ignore', 'close_time'])
-        except BinanceAPIException as e:
-            add_log(f"Binance API Error (Attempt {i+1}/{retries}): {e}. Retrying in {delay}s...")
-            time.sleep(delay)
-    add_log(f"Failed to fetch {interval} K-lines after {retries} attempts.")
-    return None
-
-def get_market_vitals(symbol):
-    vitals = {}
-    try:
-        depth = binance_client.futures_order_book(symbol=symbol, limit=20)
-        total_bids_qty = sum([float(qty) for price, qty in depth['bids']])
-        total_asks_qty = sum([float(qty) for price, qty in depth['asks']])
-        total_qty = total_bids_qty + total_asks_qty
-        vitals['order_book_imbalance'] = total_bids_qty / total_qty if total_qty > 0 else 0.5
-        mark_price_data = binance_client.futures_mark_price(symbol=symbol)
-        vitals['funding_rate'] = float(mark_price_data['lastFundingRate'])
-        open_interest_data = binance_client.futures_open_interest(symbol=symbol)
-        vitals['open_interest'] = float(open_interest_data['openInterest'])
-        if config.BINANCE_TESTNET:
-            add_log("ℹ️ Skipping Top Trader L/S Ratio on Testnet.")
-            vitals['top_trader_long_short_ratio'] = 1.0
-        else:
-            long_short_ratio = binance_client.futures_top_longshort_account_ratio(symbol=symbol, period='5m', limit=1)
-            if long_short_ratio:
-                vitals['top_trader_long_short_ratio'] = float(long_short_ratio[0]['longShortRatio'])
-            else:
-                vitals['top_trader_long_short_ratio'] = 1.0
-                add_log("⚠️ Warning: Top Trader L/S Ratio returned empty list. Defaulting to 1.0.")
-        return vitals
-    except BinanceAPIException as e:
-        add_log(f"❌ Error fetching market vitals: {e}")
-        return None
-
-# trading_bot.py (run_heavy_analysis function - Corrected)
-
-def run_heavy_analysis():
-    """Generates the full holographic analysis report for Gemini."""
-    add_log("🚀 Starting holographic analysis...")
-    
-    # --- NEW: Get current price to anchor the AI ---
-    try:
-        ticker = binance_client.futures_mark_price(symbol=config.SYMBOL)
-        current_price = float(ticker['markPrice'])
-    except Exception as e:
-        add_log(f"Could not fetch current price for analysis bundle: {e}")
-        return None
-
-    market_vitals = get_market_vitals(config.SYMBOL)
-    if not market_vitals: return None
-        
-    # --- NEW: Add the anchor price to the top of the report ---
-    
-    market_vitals = get_market_vitals(config.SYMBOL)
-    if not market_vitals: return None
-    
-    all_data_content = f"### 0. Current Market Price (Anchor)\n- **Current Price:** {current_price:.2f} USDT\n\n"
-    all_data_content = "### 1. Live Market Vitals\n"
-    all_data_content += f"- Order Book Imbalance (Buy Pressure): {market_vitals['order_book_imbalance']:.2%}\n"
-    all_data_content += f"- Funding Rate: {market_vitals['funding_rate']:.4%}\n"
-    all_data_content += f"- Open Interest (USDT): {market_vitals['open_interest']:,.2f}\n"
-    all_data_content += f"- Top Trader L/S Ratio: {market_vitals['top_trader_long_short_ratio']:.2f}\n\n"
-    all_data_content += "### 2. Multi-Timeframe K-line Depth Analysis\n"
-
-    for tf in config.ANALYSIS_TIMEFRAMES:
-        # --- CRITICAL FIX: Fetch more data to ensure indicators can warm up ---
-        # We need at least 200 candles for the EMA_200, so fetching 300 gives a buffer.
-        df = get_klines_robust(config.SYMBOL, tf, limit=300)
-        if df is None: continue
-        
-        # Explicitly name the indicator columns
-        df['EMA_20'] = df.ta.ema(length=20)
-        df['EMA_50'] = df.ta.ema(length=50)
-        
-        macd = df.ta.macd(fast=12, slow=26, signal=9)
-        df = df.join(macd)
-        
-        df['RSI_14'] = df.ta.rsi(length=14)
-        df['ATRr_14'] = df.ta.atr(length=14)
-        
-        # ADX returns a DataFrame, so we select the column
-        adx_df = df.ta.adx(length=14)
-        if adx_df is not None and 'ADX_14' in adx_df.columns:
-            df['ADX_14'] = adx_df['ADX_14']
-        
-        df['volume_ma_20'] = df['volume'].rolling(window=20).mean()
-
-        latest = df.iloc[-1]
-        
-        atr_percentage = (latest.get('ATRr_14', 0) / latest['close']) * 100 if latest['close'] > 0 else 0
-        volume_strength = latest.get('volume', 0) / latest.get('volume_ma_20', 1) if latest.get('volume_ma_20', 0) > 0 else 0
-        
-        report = f"--- Analysis Report ({tf} Timeframe) ---\n"
-        report += f"Close Price: {latest['close']:.4f}\n"
-        report += f"Trend Strength (ADX_14): {latest.get('ADX_14', 0):.2f}\n"
-        report += f"EMA 20/50: {latest.get('EMA_20', 0):.4f} / {latest.get('EMA_50', 0):.4f}\n"
-        report += f"RSI_14: {latest.get('RSI_14', 0):.2f}\n"
-        report += f"ATR_Volatility_Percent: {atr_percentage:.2f}%\n"
-        report += f"Volume_Strength_Ratio: {volume_strength:.2f}x\n"
-        all_data_content += report
-    
-    return all_data_content
-
 def is_decision_sane(decision):
     """
     Performs a sanity check on the prices provided by Gemini to prevent hallucinations.
@@ -369,114 +352,270 @@ def run_diagnostic_query(analysis_data, position_data):
 
     return "All Gemini API keys failed during diagnostic query."
 
+# --- 5. Data Acquisition and Analysis Functions ---
+def get_klines_robust(symbol, interval, limit=200, retries=3, delay=5):
+    for i in range(retries):
+        try:
+            klines = binance_client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+            columns = ['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore']
+            df = pd.DataFrame(klines, columns=columns)
+            df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+            df = df.set_index('open_time')
+            numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'quote_asset_volume', 'taker_buy_base_asset_volume']
+            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+            return df.drop(columns=['ignore', 'close_time'])
+        except BinanceAPIException as e:
+            add_log(f"Binance API Error (Attempt {i+1}/{retries}): {e}. Retrying in {delay}s...")
+            time.sleep(delay)
+    add_log(f"Failed to fetch {interval} K-lines after {retries} attempts.")
+    return None
+
+def get_market_vitals(symbol):
+    vitals = {}
+    try:
+        depth = binance_client.futures_order_book(symbol=symbol, limit=20)
+        total_bids_qty = sum([float(qty) for price, qty in depth['bids']])
+        total_asks_qty = sum([float(qty) for price, qty in depth['asks']])
+        total_qty = total_bids_qty + total_asks_qty
+        vitals['order_book_imbalance'] = total_bids_qty / total_qty if total_qty > 0 else 0.5
+        mark_price_data = binance_client.futures_mark_price(symbol=symbol)
+        vitals['funding_rate'] = float(mark_price_data['lastFundingRate'])
+        open_interest_data = binance_client.futures_open_interest(symbol=symbol)
+        vitals['open_interest'] = float(open_interest_data['openInterest'])
+        if config.BINANCE_TESTNET:
+            add_log("ℹ️ Skipping Top Trader L/S Ratio on Testnet.")
+            vitals['top_trader_long_short_ratio'] = 1.0
+        else:
+            long_short_ratio = binance_client.futures_top_longshort_account_ratio(symbol=symbol, period='5m', limit=1)
+            if long_short_ratio:
+                vitals['top_trader_long_short_ratio'] = float(long_short_ratio[0]['longShortRatio'])
+            else:
+                vitals['top_trader_long_short_ratio'] = 1.0
+                add_log("⚠️ Warning: Top Trader L/S Ratio returned empty list. Defaulting to 1.0.")
+        return vitals
+    except BinanceAPIException as e:
+        add_log(f"❌ Error fetching market vitals: {e}")
+        return None
+
+# trading_bot.py (run_heavy_analysis function - Corrected)
+
+def run_heavy_analysis():
+    """Generates the full holographic analysis report for Gemini."""
+    add_log("🚀 Starting holographic analysis...")
+    
+    # --- NEW: Get current price to anchor the AI ---
+    try:
+        ticker = binance_client.futures_mark_price(symbol=config.SYMBOL)
+        current_price = float(ticker['markPrice'])
+    except Exception as e:
+        add_log(f"Could not fetch current price for analysis bundle: {e}")
+        return None
+
+    market_vitals = get_market_vitals(config.SYMBOL)
+    if not market_vitals: return None
+        
+    # --- NEW: Add the anchor price to the top of the report ---
+    
+    market_vitals = get_market_vitals(config.SYMBOL)
+    if not market_vitals: return None
+    
+    # --- NEW: Integrate Sentiment Analysis ---
+    news_headlines = get_news_from_cryptopanic_api(symbol=config.SYMBOL.replace("USDT", ""))
+    sentiment_score = get_sentiment_score(news_headlines)
+    # --- END of new code ---
+
+    
+    all_data_content = f"### 0. Current Market Price (Anchor)\n- **Current Price:** {current_price:.2f} USDT\n\n"
+    all_data_content = "### 1. Live Market Vitals\n"
+    all_data_content += f"- Order Book Imbalance (Buy Pressure): {market_vitals['order_book_imbalance']:.2%}\n"
+    all_data_content += f"- Funding Rate: {market_vitals['funding_rate']:.4%}\n"
+    all_data_content += f"- Open Interest (USDT): {market_vitals['open_interest']:,.2f}\n"
+    all_data_content += f"- Top Trader L/S Ratio: {market_vitals['top_trader_long_short_ratio']:.2f}\n\n"
+    all_data_content += "### 2. News Sentiment Analysis (FinBERT via API)\n"
+    all_data_content += f"- Overall Sentiment Score: {sentiment_score:.2f} (-1 Negative, +1 Positive)\n"
+    all_data_content += "### 3. Multi-Timeframe K-line Depth Analysis\n"
+
+    for tf in config.ANALYSIS_TIMEFRAMES:
+        # --- CRITICAL FIX: Fetch more data to ensure indicators can warm up ---
+        # We need at least 200 candles for the EMA_200, so fetching 300 gives a buffer.
+        df = get_klines_robust(config.SYMBOL, tf, limit=300)
+        if df is None: continue
+        
+        # Explicitly name the indicator columns
+        df['EMA_20'] = df.ta.ema(length=20)
+        df['EMA_50'] = df.ta.ema(length=50)
+        
+        macd = df.ta.macd(fast=12, slow=26, signal=9)
+        df = df.join(macd)
+        
+        df['RSI_14'] = df.ta.rsi(length=14)
+        df['ATRr_14'] = df.ta.atr(length=14)
+        
+        # ADX returns a DataFrame, so we select the column
+        adx_df = df.ta.adx(length=14)
+        if adx_df is not None and 'ADX_14' in adx_df.columns:
+            df['ADX_14'] = adx_df['ADX_14']
+        
+        df['volume_ma_20'] = df['volume'].rolling(window=20).mean()
+
+        latest = df.iloc[-1]
+        
+        atr_percentage = (latest.get('ATRr_14', 0) / latest['close']) * 100 if latest['close'] > 0 else 0
+        volume_strength = latest.get('volume', 0) / latest.get('volume_ma_20', 1) if latest.get('volume_ma_20', 0) > 0 else 0
+        
+        report = f"--- Analysis Report ({tf} Timeframe) ---\n"
+        report += f"Close Price: {latest['close']:.4f}\n"
+        report += f"Trend Strength (ADX_14): {latest.get('ADX_14', 0):.2f}\n"
+        report += f"EMA 20/50: {latest.get('EMA_20', 0):.4f} / {latest.get('EMA_50', 0):.4f}\n"
+        report += f"RSI_14: {latest.get('RSI_14', 0):.2f}\n"
+        report += f"ATR_Volatility_Percent: {atr_percentage:.2f}%\n"
+        report += f"Volume_Strength_Ratio: {volume_strength:.2f}x\n"
+        all_data_content += report
+    
+    return all_data_content
+def save_market_context(context_data: dict):
+    if not context_data: return
+    try:
+        with open('market_context.json', 'w') as f:
+            json.dump(context_data, f, indent=4)
+        add_log("💾 Market context saved.")
+    except Exception as e:
+        add_log(f"❌ Error saving market context: {e}")
+
+def load_market_context() -> dict:
+    try:
+        with open('market_context.json', 'r') as f:
+            context = json.load(f)
+            add_log("🧠 Market context loaded from last session.")
+            return context
+    except FileNotFoundError:
+        add_log("No previous market context found. Starting fresh.")
+        return {}
+    except Exception as e:
+        add_log(f"❌ Error loading market context: {e}")
+        return {}
+
 def parse_decision_block(raw_text: str) -> dict:
-    """
-    Parses the structured text block from Gemini's response into a dictionary.
-    This function is designed to be robust against extra text or formatting errors.
-    """
     decision = {}
     in_block = False
-    
-    # A mapping of keys to their expected types for automatic conversion
-    type_map = {
-        "ENTRY_PRICE": float, "STOP_LOSS": float, "TAKE_PROFIT": float,
-        "LEVERAGE": int, "RISK_PERCENT": float, "TRIGGER_PRICE": float,
-        "TRIGGER_TIMEOUT": int, "NEW_STOP_LOSS": float, "NEW_TAKE_PROFIT": float
-    }
-
+    type_map = {"ENTRY_PRICE": float, "STOP_LOSS": float, "TAKE_PROFIT": float, "LEVERAGE": int, "RISK_PERCENT": float, "TRIGGER_PRICE": float, "TRIGGER_TIMEOUT": int, "NEW_STOP_LOSS": float, "NEW_TAKE_PROFIT": float}
     for line in raw_text.splitlines():
         line = line.strip()
-        
-        if line == '[DECISION_BLOCK]':
-            in_block = True
-            continue
-        
-        if line == '[END_BLOCK]':
-            break
-
+        if line == '[DECISION_BLOCK]': in_block = True; continue
+        if line == '[END_BLOCK]': break
         if in_block and ':' in line:
-            # Split only on the first colon to handle reasoning text with colons
             key, value = line.split(':', 1)
-            key = key.strip()
+            key = key.strip().upper()
             value = value.strip()
-            
-            # Convert value to the correct type if needed
             if key in type_map:
-                try:
-                    decision[key.lower()] = type_map[key](value)
-                except (ValueError, TypeError):
-                    add_log(f"⚠️ Parser Warning: Could not convert '{value}' for key '{key}'. Defaulting to 0 or None.")
-                    decision[key.lower()] = None
-            else:
-                # Keys like ACTION, REASONING, etc., remain strings
-                decision[key.lower()] = value
-    
+                try: decision[key.lower()] = type_map[key](value)
+                except (ValueError, TypeError): decision[key.lower()] = None
+            else: decision[key.lower()] = value
     return decision
 
-# --- 6. Gemini Decision Function ---
+def parse_context_block(raw_text: str) -> dict:
+    context = {}
+    in_block = False
+    type_map = {"KEY_SUPPORT": float, "KEY_RESISTANCE": float}
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if line == '[MARKET_CONTEXT_BLOCK]': in_block = True; continue
+        if line == '[END_CONTEXT_BLOCK]': break
+        if in_block and ':' in line:
+            key, value = line.split(':', 1)
+            key = key.strip().upper()
+            value = value.strip()
+            if key in type_map:
+                try: context[key.lower()] = type_map[key](value)
+                except (ValueError, TypeError): context[key.lower()] = 0.0
+            else: context[key.lower()] = value
+    if context: context['last_full_analysis_timestamp'] = datetime.now(timezone.utc).isoformat()
+    return context
 
-# --- 6. Gemini Decision Function (Text-Based V3) ---
+# --- 6. AI Interaction and Learning ---
 
-def get_gemini_decision(analysis_data, position_data):
-    """
-    Gets a trading decision from Gemini using a structured text format,
-    then parses it into a Python dictionary.
-    """
+def summarize_and_learn(trade_history_entry: str):
+    """Asks Gemini to analyze a closed trade, extract a lesson, and update the memory file."""
     global current_key_index
-    
-    prompt = f"""
-    {GEMINI_SYSTEM_PROMPT_TEXT_BASED}
+    add_log("🧠 Performing post-trade analysis to update memory...")
+    memory_prompt = f"""You are a master trading analyst. Your goal is to learn from every trade. Below is the data for a recently closed trade.
+    **Trade Data:**\n{trade_history_entry}
+    **Your Task:** Analyze this trade. Was it a good entry? Was the outcome due to a good strategy or just luck? Condense your analysis into a single, powerful, one-sentence "lesson learned" starting with "Lesson:".
+    **Example Lessons:**
+    - "Lesson: Shorting into a strong 15m uptrend, even with a high L/S ratio, is risky and often results in being stopped out."
+    - "Lesson: Entering a long position near the 1h EMA50 after a period of consolidation has a high probability of success."
+    Provide only the single "Lesson:" line."""
+    for i in range(len(config.GEMINI_API_KEYS)):
+        try:
+            key = config.GEMINI_API_KEYS[current_key_index]
+            genai.configure(api_key=key)
+            model = genai.GenerativeModel('gemini-2.5-pro')
+            current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
+            response = model.generate_content(memory_prompt)
+            lesson = response.text.strip()
+            if "Lesson:" in lesson:
+                add_log(f"💡 New lesson learned: {lesson}")
+                with open("trade_memory.txt", "a") as f:
+                    f.write(f"- {lesson}\n")
+                return
+            else:
+                add_log("⚠️ Could not extract a valid lesson from the trade analysis.")
+        except Exception as e:
+            add_log(f"❌ Error during trade summarization on key index {current_key_index-1}: {e}")
+    add_log("🚨 All API keys failed during trade summarization.")
 
-    **--- CURRENT DATA FOR ANALYSIS ---**
 
-    **1. Current Position Status:**
-    {position_data}
+def get_gemini_decision(analysis_data, position_data, last_context_summary):
+    """Gets a trading decision from Gemini, including long-term memory."""
+    global current_key_index
+    try:
+        with open("trade_memory.txt", "r") as f:
+            lessons = "".join(f.readlines()[-10:])
+    except FileNotFoundError:
+        lessons = "No past trade lessons available yet."
 
-    **2. Holographic Market Analysis:**
-    {analysis_data}
-
-    Provide your analysis and `[DECISION_BLOCK]` now.
-    """
-    
+    prompt = f"""{GEMINI_SYSTEM_PROMPT_TEXT_BASED}
+**--- STRATEGIC MEMORY: LESSONS FROM PAST TRADES ---**
+{lessons}
+**----------------------------------------------------**
+**--- MARKET CONTEXT (YOUR LAST ANALYSIS) ---**
+{last_context_summary}
+**----------------------------------------------------**
+**--- CURRENT DATA FOR ANALYSIS ---**
+**1. Current Position Status:**
+{position_data}
+**2. Holographic Market Analysis:**
+{analysis_data}
+Based on your memory, your last analysis, and the new data, provide your full response."""
     for i in range(len(config.GEMINI_API_KEYS)):
         try:
             key = config.GEMINI_API_KEYS[current_key_index]
             add_log(f"🧠 Requesting text-based decision from Gemini with key index {current_key_index}...")
-            
-            genai.configure(api_key=key) # type: ignore
-            model = genai.GenerativeModel('gemini-flash-latest') # type: ignore
-            
+            genai.configure(api_key=key)
+            model = genai.GenerativeModel('gemini-2.5-pro')
             current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
-            
-            # Simple text-in, text-out generation. No complex schemas.
-            response = model.generate_content(prompt)
-            
+            response = model.generate_content(prompt, generation_config={"temperature": 0.2})
             raw_response_text = response.text
-            add_log("--- 🧠 GEMINI RAW TEXT RESPONSE ---")
-            add_log(raw_response_text)
-            add_log("--- END RAW TEXT RESPONSE ---")
+            add_log("--- 🧠 GEMINI RAW TEXT RESPONSE ---"); add_log(raw_response_text); add_log("--- END RAW TEXT RESPONSE ---")
             
-            # Parse the raw text to get a structured dictionary
             decision_dict = parse_decision_block(raw_response_text)
+            context_dict = parse_context_block(raw_response_text)
             
             if not decision_dict or 'action' not in decision_dict:
-                add_log("❌ Parsing failed or ACTION key is missing in the response. Trying next key.")
+                add_log("❌ Parsing failed or ACTION key is missing. Trying next key.")
                 continue
-
-            add_log(f"✅ Gemini decision parsed successfully. Action: {decision_dict.get('action')}")
-            return decision_dict
-            
+            if context_dict:
+                save_market_context(context_dict)
+            add_log(f"✅ Gemini decision parsed. Action: {decision_dict.get('action')}")
+            return decision_dict, context_dict
         except exceptions.ResourceExhausted:
             add_log(f"⚠️ Gemini API key at index {current_key_index-1} is rate-limited. Switching...")
             continue
         except Exception as e:
-            add_log(f"❌ An unexpected error occurred during Gemini call: {traceback.format_exc()}")
-            # Continue to the next key
-    
-    add_log("🚨 All Gemini API keys failed or returned unparsable responses. Pausing.")
+            add_log(f"❌ An unexpected error during Gemini call: {traceback.format_exc()}")
+    add_log("🚨 All Gemini API keys failed. Pausing.")
     time.sleep(60)
-    return None
-
+    return None, None
 
 # --- 7. Trading Execution and Management Functions ---
 def get_current_position():
@@ -646,99 +785,128 @@ def wait_for_trigger(decision):
             
     add_log(f"⏳ Wait condition timed out after {timeout_seconds} seconds. Re-analyzing.")
 
-# --- 8. Main Loop ---
-# trading_bot.py (main_loop function - with Stateless Diagnostic)
+def close_position(position):
+    add_log(f"Executing Gemini's instruction to CLOSE position...")
+    try:
+        binance_client.futures_cancel_all_open_orders(symbol=config.SYMBOL)
+        close_side = 'BUY' if position['side'] == 'SHORT' else 'SELL'
+        binance_client.futures_create_order(symbol=config.SYMBOL, side=close_side, type='MARKET', quantity=position['quantity'], reduceOnly=True)
+        add_log(f"✅ Market close order sent successfully.")
+    except BinanceAPIException as e:
+        add_log(f"❌ Failed to close position: {e}")
 
+# --- 8. Main Loop ---
 def main_loop():
     global bot_status, last_gemini_decision
     add_log("🤖 AI-Driven Trading Bot Main Loop Started.")
     
-    startup_analysis_done = False
+    was_in_position = False
+    last_position_details = {}
+    market_context = load_market_context()
 
     while True:
         try:
-            if not startup_analysis_done:
-                add_log("🚀 Performing initial startup analysis for debugging...")
-                bot_status['bot_state'] = "ANALYZING"
-                startup_analysis_done = True
-            else:
-                bot_status['bot_state'] = "SEARCHING"
-            
             pos = get_current_position()
+            is_in_position = pos['side'] is not None
+
+            if was_in_position and not is_in_position:
+                add_log("📉 Position closed. Triggering post-trade analysis and learning...")
+                try:
+                    trades = binance_client.futures_account_trade_list(symbol=config.SYMBOL, limit=2)
+                    if len(trades) > 0:
+                        closing_trade = trades[-1]
+                        pnl = float(closing_trade['realizedPnl'])
+                        outcome = "WIN" if pnl > 0 else "LOSS"
+                        trade_summary = (f"--- TRADE OUTCOME: {outcome} ---\n"
+                                         f"Direction: {last_position_details.get('side', 'N/A')}\n"
+                                         f"Entry Price: {last_position_details.get('entry_price', 'N/A')}\n"
+                                         f"Closing Price: {float(closing_trade['price']):.4f}\n"
+                                         f"Realized PNL (USDT): {pnl:.4f}\n"
+                                         f"Reason for Entry: {last_gemini_decision.get('reasoning', 'N/A')}\n"
+                                         f"Closing Reason: Automatically closed by SL/TP or external action.\n")
+                        summarize_and_learn(trade_summary)
+                    else:
+                        add_log("⚠️ Could not find recent trades to analyze for learning.")
+                except Exception as e:
+                    add_log(f"❌ An error occurred during post-trade analysis: {e}")
+            
+            was_in_position = is_in_position
+            if is_in_position:
+                last_position_details = pos.copy()
+            
+            bot_status['bot_state'] = "SEARCHING"
             position_status_report = f"Position: {pos['side'] or 'FLAT'}, Size: {pos['quantity']}, Entry Price: {pos['entry_price']}"
             
             analysis_bundle = run_heavy_analysis()
             if not analysis_bundle:
-                time.sleep(60)
-                continue
-                
-            decision = get_gemini_decision(analysis_bundle, position_status_report)
+                time.sleep(60); continue
+            
+            context_summary = "\n".join([f"- {k.replace('_', ' ').title()}: {v}" for k, v in market_context.items()])
+            if not context_summary:
+                context_summary = "No market context from previous sessions is available."
+
+            decision, new_context = get_gemini_decision(analysis_bundle, position_status_report, context_summary)
+            
+            if new_context:
+                market_context = new_context
+            
             if not decision:
-                time.sleep(60)
-                continue
+                time.sleep(60); continue
             
             bot_status['last_gemini_decision'] = decision
             last_gemini_decision = decision
             
             if not is_decision_sane(decision):
-                add_log("🚨 SANITY CHECK FAILED. Initiating diagnostic query to understand AI's reasoning...")
-                
-                # --- NEW: Call the diagnostic function ---
-                diagnostic_text = run_diagnostic_query(analysis_bundle, position_status_report)
-                
-                add_log("--- 🧠 GEMINI RAW THOUGHT PROCESS (DIAGNOSTIC) ---")
-                # Log the raw, unconstrained thoughts of the AI
-                add_log(diagnostic_text)
-                add_log("--- END DIAGNOSTIC ---")
-
-                add_log("Aborting action due to failed sanity check. Re-analyzing in next cycle.")
-                time.sleep(60) # Wait a minute before trying again
-                continue
+                add_log("🚨 SANITY CHECK FAILED. Aborting action.")
+                time.sleep(60); continue
             
-            # --- If Sanity Check Passes, Proceed with Action ---
             add_log(f"💡 Gemini Action Plan: {decision.get('action')}. Reason: {decision.get('reasoning')}")
             action = decision.get('action')
             
             if action == 'OPEN_POSITION':
-                if pos['side']: add_log("⚠️ Gemini wants to open but already in position. Holding.")
-                else: open_position(decision)
-                time.sleep(config.DEFAULT_MONITORING_INTERVAL)
+                if pos['side']:
+                    add_log("⚠️ Gemini wants to open but already in position. Holding.")
+                else:
+                    confidence = decision.get('confidence')
+                    if confidence == 'low':
+                        add_log(f"📉 SKIPPING TRADE: Gemini's confidence is LOW.")
+                    elif confidence in ['medium', 'high']:
+                        add_log(f"🔥 Executing trade with {confidence.upper()} confidence.")
+                        open_position(decision)
+                    else:
+                        add_log(f"⚠️ Unknown confidence level '{confidence}'. Skipping trade for safety.")
+            
             elif action == 'CLOSE_POSITION':
                 if pos['side']: close_position(pos)
                 else: add_log("⚠️ Gemini wants to close but position is already flat.")
-                time.sleep(config.DEFAULT_MONITORING_INTERVAL)
+            
             elif action == 'MODIFY_POSITION':
                 if pos['side']: modify_position(decision, pos)
                 else: add_log("⚠️ Gemini wants to modify but position is flat.")
-                time.sleep(config.DEFAULT_MONITORING_INTERVAL)
+
             elif action == 'WAIT':
-                # --- MODIFICATION START ---
-                # Check for the presence of trigger keys to decide the wait type.
-                # This is more robust and matches our new text-based prompt.
                 trigger_price = decision.get('trigger_price')
                 trigger_direction = decision.get('trigger_direction')
-
                 if trigger_price and trigger_direction and trigger_price > 0:
                     add_log("Trigger conditions found, entering fast-check wait mode.")
                     wait_for_trigger(decision)
                 else:
-                    # If AI says WAIT but provides no specific trigger, default to monitoring.
-                    add_log(f"Gemini instructed to wait without a specific price trigger. Monitoring continuously...")
-                    time.sleep(config.DEFAULT_MONITORING_INTERVAL)
-                # --- MODIFICATION END ---
+                    add_log(f"Gemini instructed to wait without a specific trigger. Monitoring continuously...")
             
             else:
                 add_log(f"Unknown action from Gemini: {action}. Waiting.")
-                time.sleep(config.DEFAULT_MONITORING_INTERVAL)
+            
+            # Default sleep interval after an action
+            time.sleep(config.DEFAULT_MONITORING_INTERVAL)
 
         except KeyboardInterrupt:
-            # ... (KeyboardInterrupt logic remains the same)
+            add_log("🛑 User interrupted. Shutting down...")
             break
         except Exception as e:
-            # ... (Detailed error logging remains the same)
+            add_log(f"💥 CRITICAL ERROR in main loop: {traceback.format_exc()}")
             time.sleep(60)
 
 if __name__ == "__main__":
-    # To make this a single, runnable file, you need to paste the full implementations
-    # of all functions where they are called.
+    # Ensure you have pasted all required function definitions into this single file
+    # before running, especially the data analysis and execution functions.
     main_loop()
