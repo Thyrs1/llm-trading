@@ -449,7 +449,7 @@ def run_backtest(historical_data, sim_exchange):
         
         # --- D. Call AI for a Decision ---
         
-        is_scheduled_call = (i % 3 == 0)
+        is_scheduled_call = (i % 1 == 0)
         
         # 4. This line now works because is_triggered is always defined.
         is_forced_call = is_triggered 
@@ -497,8 +497,8 @@ def run_backtest(historical_data, sim_exchange):
 if __name__ == '__main__':
     # Define backtest parameters here
     backtest_symbol = "SOLUSDT"
-    start_date = "17 October, 2025"
-    end_date = "18 October, 2025" # A shorter period is better for initial tests due to API call speed
+    start_date = "1 June, 2025"
+    end_date = "15 June, 2025" # A shorter period is better for initial tests due to API call speed
     
     # 1. Download data
     hist_data = get_historical_data(
