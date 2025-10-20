@@ -3,6 +3,8 @@ config.py
 status.json
 run.sh
 run.bat
+hist_data_*
+market_context.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
