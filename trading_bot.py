@@ -170,7 +170,7 @@ except Exception as e:
     exit()
 
 try:
-    gemini_model = genai.GenerativeModel('gemini-2.5-pro') # Using the latest flash model
+    gemini_model = genai.GenerativeModel('gemini-flash-latest') # Using the latest flash model
     add_log(f"✅ Gemini AI model loaded. Using {len(config.GEMINI_API_KEYS)} API keys for rotation.")
 except Exception as e:
     add_log(f"❌ Gemini AI initialization failed: {e}")
@@ -565,7 +565,7 @@ def summarize_and_learn(trade_history_entry: str):
         try:
             key = config.GEMINI_API_KEYS[current_key_index]
             genai.configure(api_key=key)
-            model = genai.GenerativeModel('gemini-2.5-pro')
+            model = genai.GenerativeModel('gemini-flash-latest')
             current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
             response = model.generate_content(memory_prompt)
             lesson = response.text.strip()
@@ -615,9 +615,9 @@ Based on your memory, your last analysis, and the new data, provide your full re
             key = config.GEMINI_API_KEYS[current_key_index]
             add_log(f"🧠 Requesting text-based decision from Gemini with key index {current_key_index}...")
             genai.configure(api_key=key)
-            model = genai.GenerativeModel('gemini-2.5-pro')
+            model = genai.GenerativeModel('gemini-flash-latest')
             current_key_index = (current_key_index + 1) % len(config.GEMINI_API_KEYS)
-            response = model.generate_content(prompt, generation_config={"temperature": 0.2})
+            response = model.generate_content(prompt, generation_config={"temperature": 0})
             raw_response_text = response.text
             add_log("--- 🧠 GEMINI RAW TEXT RESPONSE ---"); add_log(raw_response_text); add_log("--- END RAW TEXT RESPONSE ---")
             

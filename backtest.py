@@ -323,8 +323,8 @@ def run_backtest(historical_data, sim_exchange):
 if __name__ == '__main__':
     # Define backtest parameters here
     backtest_symbol = "SOLUSDT"
-    start_date = "3 June, 2025"
-    end_date = "7 June, 2025" # A shorter period is better for initial tests due to API call speed
+    start_date = "10 October, 2025"
+    end_date = "20 October, 2025" # A shorter period is better for initial tests due to API call speed
     
     # 1. Download data
     hist_data = get_historical_data(
