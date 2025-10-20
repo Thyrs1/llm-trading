@@ -181,12 +181,18 @@ GEMINI_SYSTEM_PROMPT_TEXT_BASED = """
 **DIRECTIVE**
 Your new persona is 'The Sniper'. You are patient, disciplined, and only act on A+ high-probability setups. Your goal is capital preservation first, profit second. You are no longer a high-frequency scalper; you are a precision trend and reversal trader.
 
+**DIRECTIVE**
+Your new persona is 'The Swing Trader'. Your objective is to capture the primary "swing" or move in the market over an hour to multi-hour period. You operate primarily on the 1h and 4h chart structures. The shorter timeframes (1m, 5m, 15m) are only used for fine-tuning your entry and exit points, not for generating signals. Your goal is to achieve a high Risk/Reward ratio on a smaller number of high-quality trades.
+
 **NEW TRADING RULES:**
-1.  **PATIENCE IS PARAMOUNT:** You will only issue an `OPEN_POSITION` command if a setup is of `high` confidence. If there is any doubt, the correct action is always `WAIT`. Do not force trades.
-2.  **HIGHER TIMEFRAME (HTF) CONFLUENCE:** You must trade in the direction of the dominant trend on a higher timeframe (1h or 4h, based on the provided data). Do not take short-term counter-trend trades unless the reversal signal is exceptionally strong (e.g., major resistance hit on high volume).
-3.  **MINIMUM RISK/REWARD RATIO:** Every `OPEN_POSITION` decision **must** have a `TAKE_PROFIT` that is at least **1.5 times** further from the `ENTRY_PRICE` than the `STOP_LOSS`. (Example: If Stop Loss is $1 away, Take Profit must be at least $1.50 away). If you cannot find a setup that meets this 1.5 R/R, you must `WAIT`.
-4.  **REDUCE RISK:** Your `RISK_PERCENT` should be conservative. For `high` confidence trades, a range of 20% to 50% is appropriate. Do not use hyper-aggressive risk.
-5.  **SENTIMENT INTEGRATION:** Use the provided sentiment score to gauge market mood. A strongly positive sentiment should increase your confidence in long setups, while a strongly negative sentiment should do the same for shorts. Neutral sentiment requires more caution.
+1.  **PRIMARY ANALYSIS ON HTF:** Your core trading decisions (bullish/bearish bias, key levels) MUST be derived from the 1-hour and 4-hour data provided. Do not get distracted by short-term noise on the minute charts.
+2.  **TRADE DURATION:** Your setups should aim to be held for several hours to a few days to capture the bulk of a market swing. This is not scalping.
+3.  **SUPERIOR RISK/REWARD RATIO:** Every `OPEN_POSITION` decision **must** have a `TAKE_PROFIT` that is at least **2.5 times** further from the `ENTRY_PRICE` than the `STOP_LOSS`. A 3.0 R/R or higher is ideal. If you cannot find a setup that meets this minimum 2.5 R/R, you MUST `WAIT`.
+4.  **CONSERVATIVE RISK:** Your `RISK_PERCENT` for any single trade must be between **1.0% and 25.0%** of total equity.
+5.  **ENTRY STRATEGY:** Do not chase breakouts. The ideal entry is a pullback to a confirmed higher timeframe support level (for a long) or resistance level (for a short). Wait for the price to come to you.
+
+**YOUR TASK:**
+Analyze the provided memory and market data. If a high-quality swing trade setup conforming to ALL the rules above is present, provide the `[DECISION_BLOCK]`. Otherwise, the correct and most profitable action is to `WAIT`.
 
 **FORMATTING RULES FOR [DECISION_BLOCK]**
 1.  Starts with `[DECISION_BLOCK]` and ends with `[END_BLOCK]`.
@@ -214,10 +220,13 @@ Your new persona is 'The Sniper'. You are patient, disciplined, and only act on 
 
 **ADDITIONAL REQUIREMENT: Market Context Summary**
 After `[END_BLOCK]`, you MUST provide a `[MARKET_CONTEXT_BLOCK]`. This is your persistent view of the market.
-*   `MARKET_THESIS`: Short summary of your overall view (e.g., "Bullish but overbought", "Bearish consolidation").
-*   `KEY_SUPPORT`: Most important support price.
-*   `KEY_RESISTANCE`: Most important resistance price.
-*   `DOMINANT_TREND`: The timeframe (e.g., 1m, 5m, 15m, 1h) currently driving the price.
+**FORMATTING RULES FOR [MARKET_CONTEXT_BLOCK]**
+...
+*   `MARKET_THESIS`: A short summary of your overall market view.
+*   `KEY_SUPPORT_LEVELS`: A comma-separated list of the 2-3 most important support price levels you are watching (e.g., "188.50, 185.00, 182.25").
+*   `KEY_RESISTANCE_LEVELS`: A comma-separated list of the 2-3 most important resistance price levels (e.g., "192.80, 195.00, 200.00").
+*   `DOMINANT_TREND_TIMEFRAME`: The timeframe (e.g., 5m, 15m, 1h, 4h) that you believe is currently driving the price action.
+...
 
 **EXAMPLE of the full output:**
 [DECISION_BLOCK]
@@ -495,22 +504,39 @@ def parse_decision_block(raw_text: str) -> dict:
     return decision
 
 def parse_context_block(raw_text: str) -> dict:
+    """Parses the market context block, including comma-separated levels, into a dictionary."""
     context = {}
     in_block = False
-    type_map = {"KEY_SUPPORT": float, "KEY_RESISTANCE": float}
+    
+    # Define keys that should be parsed as lists of floats
+    list_keys = ["KEY_SUPPORT_LEVELS", "KEY_RESISTANCE_LEVELS"]
+
     for line in raw_text.splitlines():
         line = line.strip()
-        if line == '[MARKET_CONTEXT_BLOCK]': in_block = True; continue
-        if line == '[END_CONTEXT_BLOCK]': break
+        if line == '[MARKET_CONTEXT_BLOCK]':
+            in_block = True
+            continue
+        if line == '[END_CONTEXT_BLOCK]':
+            break
         if in_block and ':' in line:
             key, value = line.split(':', 1)
-            key = key.strip().upper()
+            key = key.strip().upper() # Use upper for consistent matching
             value = value.strip()
-            if key in type_map:
-                try: context[key.lower()] = type_map[key](value)
-                except (ValueError, TypeError): context[key.lower()] = 0.0
-            else: context[key.lower()] = value
-    if context: context['last_full_analysis_timestamp'] = datetime.now(timezone.utc).isoformat()
+            
+            if key in list_keys:
+                try:
+                    # Split by comma, strip whitespace from each part, convert to float
+                    levels = [float(level.strip()) for level in value.split(',') if level.strip()]
+                    context[key.lower()] = levels
+                except (ValueError, TypeError):
+                    context[key.lower()] = [] # Default to empty list on error
+            else:
+                # Handle single value keys as before
+                context[key.lower()] = value
+    
+    if context:
+        context['last_full_analysis_timestamp'] = datetime.now(timezone.utc).isoformat()
+
     return context
 
 # --- 6. AI Interaction and Learning ---
