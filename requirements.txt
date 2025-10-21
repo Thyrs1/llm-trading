@@ -8,6 +8,7 @@ anyio==4.11.0
 asttokens==3.0.0
 attrs==25.4.0
 backcall==0.2.0
+backtrader==1.9.78.123
 beautifulsoup4==4.14.2
 bleach==6.2.0
 blinker==1.9.0

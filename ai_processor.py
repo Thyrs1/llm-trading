@@ -97,30 +97,74 @@ def get_news_from_rss(symbol: str, limit=10) -> str:
     return ". ".join(list(dict.fromkeys(relevant_headlines))[:limit])
 
 def parse_decision_block(raw_text: str) -> Dict:
+    """
+    Parses [DECISION_BLOCK] using a hybrid approach. It handles simple KEY: VALUE lines
+    and also detects and parses a multi-line JSON value for the 'TRIGGERS' key.
+    """
     decision = {}
-    decision_str = ""
     try:
         decision_str = raw_text.split('[DECISION_BLOCK]')[1].split('[END_BLOCK]')[0].strip()
-        if '"triggers":' in decision_str.lower():
-            start_brace = decision_str.find('{')
-            end_brace = decision_str.rfind('}') + 1
-            if start_brace != -1 and end_brace != -1:
-                json_part = decision_str[start_brace:end_brace]
-                decision = json.loads(json_part)
-                return {k.lower(): v for k, v in decision.items()}
-    except (IndexError, json.JSONDecodeError) as e:
-        print(f"⚠️ JSON parsing failed: {e}. Falling back to line-by-line parsing.")
-    type_map = {"ENTRY_PRICE": float, "STOP_LOSS": float, "TAKE_PROFIT": float, "LEVERAGE": int, "RISK_PERCENT": float, "TRAILING_ACTIVATION_PRICE": float, "TRAILING_DISTANCE_PCT": float, "NEW_STOP_LOSS": float, "NEW_TAKE_PROFIT": float, "TRIGGER_PRICE": float, "TRIGGER_LEVEL": float, "TRIGGER_TIMEOUT": int}
-    for line in decision_str.splitlines():
-        if ':' in line:
-            key, value = line.split(':', 1)
-            key, value = key.strip().upper(), value.strip()
-            key_lower = key.lower()
-            if key in type_map:
-                try: decision[key_lower] = type_map[key](value)
-                except (ValueError, TypeError): decision[key_lower] = None
-            else:
-                decision[key_lower] = value
+    except IndexError:
+        print("⚠️ [DECISION_BLOCK] not found in AI response.")
+        return {}
+
+    lines = decision_str.splitlines()
+    json_buffer = ""
+    in_json_block = False
+
+    type_map = {
+        "ENTRY_PRICE": float, "STOP_LOSS": float, "TAKE_PROFIT": float, "LEVERAGE": int,
+        "RISK_PERCENT": float, "TRAILING_ACTIVATION_PRICE": float, "TRAILING_DISTANCE_PCT": float,
+        "NEW_STOP_LOSS": float, "NEW_TAKE_PROFIT": float, "TRIGGER_PRICE": float, 
+        "TRIGGER_LEVEL": float, "TRIGGER_TIMEOUT": int
+    }
+
+    for line in lines:
+        stripped_line = line.strip()
+        
+        # State machine to handle the TRIGGERS JSON block
+        if stripped_line.upper().startswith("TRIGGERS:"):
+            in_json_block = True
+            # Start capturing the JSON from the opening bracket
+            try:
+                json_buffer += stripped_line.split(':', 1)[1].strip()
+            except IndexError:
+                pass # Handles case where '[' is on the next line
+            continue
+
+        if in_json_block:
+            json_buffer += stripped_line
+            # If we find the closing bracket, the block is complete
+            if stripped_line.endswith("]"):
+                try:
+                    # Clean up the buffer and parse as JSON
+                    clean_json = json_buffer.strip().strip(',')
+                    decision['triggers'] = json.loads(clean_json)
+                except json.JSONDecodeError as e:
+                    print(f"❌ Failed to parse TRIGGERS JSON block: {e}\nBlock content was: {json_buffer}")
+                # Reset state machine
+                in_json_block = False
+                json_buffer = ""
+        
+        # If not in a JSON block, parse as a simple KEY: VALUE pair
+        else:
+            if ':' in line:
+                key, value = line.split(':', 1)
+                key, value = key.strip().upper(), value.strip()
+                key_lower = key.lower()
+
+                # Skip TRIGGERS key if it's handled separately
+                if key_lower == 'triggers':
+                    continue
+
+                if key in type_map:
+                    try:
+                        decision[key_lower] = type_map[key](value)
+                    except (ValueError, TypeError):
+                        decision[key_lower] = None
+                else:
+                    decision[key_lower] = value
+                    
     return decision
 
 def parse_context_block(raw_text: str) -> Dict:

@@ -6,6 +6,8 @@ run.bat
 hist_data_*
 market_context*.json
 report*
+*.csv
+*.db
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
