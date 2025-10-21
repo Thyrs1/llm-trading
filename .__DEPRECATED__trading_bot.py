@@ -885,18 +885,18 @@ def wait_for_trigger(decision):
             
             if direction.upper() == 'ABOVE' and current_price > price:
                 add_log(f"🎯 Trigger condition MET: Price {current_price:.4f} crossed ABOVE {price:.4f}.")
-                return
+                return True
             if direction.upper() == 'BELOW' and current_price < price:
                 add_log(f"🎯 Trigger condition MET: Price {current_price:.4f} crossed BELOW {price:.4f}.")
-                return
+                return True
                 
-            # Check every 5 seconds
-            time.sleep(5)
+            time.sleep(1)
         except Exception as e:
             add_log(f"Error in wait_for_trigger loop: {e}")
             time.sleep(15) # Wait longer on error
             
     add_log(f"⏳ Wait condition timed out after {timeout_seconds} seconds. Re-analyzing.")
+    return False
 
 def close_position(position):
     add_log(f"Executing AI's instruction to CLOSE position...")
@@ -1002,9 +1002,18 @@ def main_loop():
             elif action == 'WAIT':
                 trigger_price = decision.get('trigger_price')
                 trigger_direction = decision.get('trigger_direction')
+                
                 if trigger_price and trigger_direction and trigger_price > 0:
                     add_log("Trigger conditions found, entering fast-check wait mode.")
-                    wait_for_trigger(decision)
+                    
+                    # Store whether the trigger was hit
+                    trigger_hit = wait_for_trigger(decision)
+                    
+                    if trigger_hit:
+                        # CRITICAL FIX: Skip the rest of the current loop iteration
+                        # and restart immediately to begin analysis.
+                        continue 
+                    
                 else:
                     add_log(f"AI instructed to wait without a specific trigger. Monitoring continuously...")
             
