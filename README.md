@@ -13,17 +13,21 @@
 </p>
 
 ### Description
-A few python scripts to automatically trade in cryptocurrencies markets w/ the help of large-language-models. Featuring state-machine, position SL/TP management, notification service, a clean and nice Dashboard and more.
+**TO BE NOTED:** This project is a prove-of-concept, contribute to make it more usable.
+A few python scripts to automatically trade in cryptocurrencies markets w/ the help of large-language-models. 
+Featuring Backtesting, State-less Full AI Decisions, a clean monitoring Dashboard, and more.
 
 ### Installation
  - `git clone https://github.com/Thyrs1/llm-trading`
  - `pip -q requirements.txt`
 
-### Usage
- - `mv config_template.py config.py`
- - `python ./trading_bot.py`
- - `python ./dashboard.py`
- - `python ./watcher.py`
+### Usage of Backtest Bot
+ - `mv config.template.py config.py`
+ - `python ./advanced_backtester.py`
+
+### Usage of Live Bot
+ - `mv config.template.py config.py`
+ - `python ./llm_trading_bot.py`
 
 ### Disclaimer 
 Not guaranteed in profits, not a recommendation to investing.
