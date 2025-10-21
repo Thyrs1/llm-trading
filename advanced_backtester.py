@@ -5,6 +5,7 @@ import pandas as pd
 from datetime import datetime
 import json
 import time
+import traceback
 
 # Import all the REAL methods from your project files
 from ai_processor import (
@@ -44,7 +45,7 @@ class LiveAIStrategy(bt.Strategy):
         self.order = None
         self.trade_entry_price = 0
         self.trade_entry_reason = ""
-        self.active_sl_tp = {} # To store SL/TP for the current trade
+        self.active_sl_tp = {} 
 
     def log(self, txt, dt=None):
         dt = dt or self.d5m.datetime.datetime(0)
@@ -54,7 +55,7 @@ class LiveAIStrategy(bt.Strategy):
         if trade.isclosed:
             self.log(f'TRADE CLOSED, PNL: {trade.pnlcomm:.2f}')
             
-            pnl_pct = (trade.pnlcomm / self.trade_entry_price) if self.trade_entry_price != 0 else 0.0
+            pnl_pct = (trade.pnlcomm / (self.trade_entry_price * abs(trade.size))) if self.trade_entry_price * abs(trade.size) != 0 else 0.0
             side = "LONG" if trade.history[0].event.size > 0 else "SHORT"
             
             log_trade(
@@ -80,11 +81,8 @@ class LiveAIStrategy(bt.Strategy):
         if self.order:
             return
 
-        # --- On each candle, run the full, live AI decision process ---
-        
-        # 1. Construct the historical DataFrame for analysis
         bars_to_process = min(len(self.d5m), 200)
-        if bars_to_process < 60: # Not enough data for indicators
+        if bars_to_process < 60:
             return
             
         df_5m = pd.DataFrame({
@@ -101,11 +99,10 @@ class LiveAIStrategy(bt.Strategy):
         analysis_bundle = analyze_freqtrade_data(df_5m, current_price)
         pos_report = "Side: FLAT" if not self.position else f"Side: {'LONG' if self.position.size > 0 else 'SHORT'}"
         
-        # 2. Make the LIVE API call to the real AI
         self.log("Requesting live AI decision...")
         decision, _, _ = get_ai_decision_sync(
             analysis_data=analysis_bundle, position_data=pos_report, context_summary="{}",
-            live_equity=self.broker.getvalue(), sentiment_score=0.0 # Assuming neutral sentiment
+            live_equity=self.broker.getvalue(), sentiment_score=0.0
         )
         
         if not decision:
@@ -114,8 +111,7 @@ class LiveAIStrategy(bt.Strategy):
 
         action = decision.get('action')
         
-        # 3. Act on the AI's decision
-        if not self.position: # If we are flat
+        if not self.position:
             if action == 'OPEN_POSITION' and decision.get('confidence') == 'high':
                 side = decision.get('decision')
                 sl = decision.get('stop_loss')
@@ -147,7 +143,7 @@ class LiveAIStrategy(bt.Strategy):
             else:
                 self.log(f"AI DECISION: {action}. Reason: {decision.get('reasoning', 'N/A')}")
         
-        elif self.position: # If we are in a position, check for exit conditions
+        elif self.position:
             sl = self.active_sl_tp.get('sl')
             tp = self.active_sl_tp.get('tp')
 
@@ -178,17 +174,19 @@ if __name__ == '__main__':
     data_path = 'SOLUSDT-5m-data.csv'
     
     try:
-        dataframe = pd.read_csv(
-            data_path,
-            names=['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_volume', 'count', 'taker_buy_volume', 'taker_buy_quote_volume', 'ignore'],
-            header=None # This prevents pandas from treating the first row as a header
-        )
+        # This correctly reads a CSV that HAS a header row.
+        dataframe = pd.read_csv(data_path)
+        
         dataframe['datetime'] = pd.to_datetime(dataframe['open_time'], unit='ms')
         dataframe.set_index('datetime', inplace=True)
         # For a quicker test run, uncomment the next line:
-        # dataframe = dataframe.tail(500)
+        # dataframe = dataframe.tail(500) 
     except FileNotFoundError:
         print(f"ERROR: Data file '{data_path}' not found.")
+        exit()
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        print(traceback.format_exc())
         exit()
 
     data_5m = BinanceData(dataname=dataframe, name="SOLUSDT")
