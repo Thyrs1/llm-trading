@@ -4,7 +4,7 @@ status.json
 run.sh
 run.bat
 hist_data_*
-market_context.json
+market_context*.json
 report*
 
 # Byte-compiled / optimized / DLL files

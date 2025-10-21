@@ -32,7 +32,7 @@ DEFAULT_MONITORING_INTERVAL = 300  # 5 minutes
 # How long to wait before retrying a failed API call (in seconds)
 API_RETRY_DELAY = 15
 # How frequently the main loop runs to check for triggers and TSL (in seconds)
-FAST_CHECK_INTERVAL = 3
+FAST_CHECK_INTERVAL = 10 # Polling rate for the single process
 
 AI_SYSTEM_PROMPT = """
 **PERSONA: 'THE ADAPTIVE PREDATOR'**
@@ -70,5 +70,4 @@ You are 'The Adaptive Predator', an elite, risk-aware momentum and trend-continu
         }}
     ]
 }}
-
 """

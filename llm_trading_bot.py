@@ -1,71 +1,70 @@
-
-# LLM_Trading_Bot.py (V19.0 - Multi-Process Multi-Symbol Engine)
+# LLM_Trading_Bot.py (V22.0 - Final Synchronous Polling with DB and WebUI)
 
 # --- Standard Library Imports ---
-import asyncio
-import json
 import time
+import json
 import traceback
 from collections import deque
 from typing import Dict, Any, List, Tuple
-from datetime import datetime, timezone
-from concurrent.futures import ProcessPoolExecutor
-import multiprocessing as mp
-import os
-import signal
+import threading # For running the web dashboard
 import sys
 
 # --- Project Modules ---
 import config
-# Note: Renaming module imports to avoid conflicts if needed, but not strictly necessary here
 from execution_manager import ExchangeManager 
 from ai_processor import (
-    init_ai_client, # Now imported directly
-    init_finbert_process, get_sentiment_score_async, get_news_from_rss,
-    get_ai_decision, analyze_freqtrade_data, process_klines,
-    summarize_and_learn
+    init_ai_client,
+    init_finbert_analyzer, get_sentiment_score_sync, get_news_from_rss,
+    get_ai_decision_sync, analyze_freqtrade_data, process_klines,
+    summarize_and_learn_sync
 )
+from database_manager import setup_database, log_system_message, log_trade, update_bot_state # NEW DB IMPORTS
+from web_dashboard import start_dashboard # NEW WEBUI IMPORT
 import pandas as pd
 import pandas_ta as ta
 
-# --- Global State & Utilities (Local to each Process) ---
-# These are local to the current process and manage the state for the *single* symbol it handles.
-LOG_DEQUE = deque(maxlen=200)
-HISTORICAL_DATA: Dict[str, pd.DataFrame] = {} # Keyed by symbol, but only one symbol per process
-SYMBOL_BOT_STATE: Dict[str, Any] = {} # State for the single symbol this process manages
+# --- Global State & Utilities (Single Process) ---
+# LOG_DEQUE is now redundant but kept for local logging before DB is ready
+LOG_DEQUE = deque(maxlen=200) 
+HISTORICAL_DATA: Dict[str, pd.DataFrame] = {} 
+BOT_STATE: Dict[str, Any] = {} 
+AI_CLIENT = None 
 
-# --- Utility Functions (Adapted for Per-Symbol Context) ---
+# --- Utility Functions (Modified to use DB logging) ---
 def add_log(message: str, symbol: str = "SYSTEM"):
-    """Adds a message to the log deque and prints it."""
-    # Prefix log with PID to easily distinguish processes
-    pid = os.getpid()
-    log_entry = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [PID:{pid}] [{symbol}] {message}"
-    LOG_DEQUE.appendleft(log_entry)
-    print(log_entry)
+    """Logs a message to the database and prints it."""
+    # Use the DB function for logging
+    log_system_message(message, symbol)
 
 def load_market_context(symbol: str) -> Dict:
-    """Loads the last market context for the specific symbol from a file."""
+    """Loads the last market context for the specific symbol from the DB/file."""
+    # In a real system, this would load from the DB state table. 
+    # For simplicity, we keep the file-based loading as a fallback/initialization.
     context_file = f'market_context_{symbol.replace("/", "_")}.json'
     try:
         with open(context_file, 'r') as f:
             context = json.load(f)
-            add_log(f"🧠 Market context loaded from last session for {symbol}.", symbol)
+            log_system_message(f"🧠 Market context loaded from last session for {symbol}.", symbol)
             return context
     except Exception:
-        add_log(f"No previous market context found for {symbol}. Starting fresh.", symbol)
+        log_system_message(f"No previous market context found for {symbol}. Starting fresh.", symbol)
         return {}
 
-def save_market_context(symbol: str, context: Dict):
-    """Saves the current market context for the symbol to a file."""
-    context_file = f'market_context_{symbol.replace("/", "_")}.json'
-    try:
-        with open(context_file, 'w') as f:
-            json.dump(context, f, indent=4)
-    except Exception as e:
-        add_log(f"❌ Error saving market context for {symbol}: {e}", symbol)
+def save_market_context():
+    """Saves the current market context for all symbols to the database."""
+    for symbol, state in BOT_STATE.items():
+        # Prepare position data for DB update
+        pos_data = {
+            'side': state['current_position'].get('side'),
+            'entry_price': state['current_position'].get('entry_price'),
+            'quantity': state['current_position'].get('quantity'),
+            'unrealized_pnl': state['current_position'].get('unrealized_pnl', 0.0)
+        }
+        is_in_position = pos_data['side'] is not None
+        update_bot_state(symbol, is_in_position, pos_data, state['market_context'])
 
 def calculate_position_size(equity, available_margin, risk_percent, entry_price, stop_loss_price, leverage, symbol, exchange_manager: ExchangeManager):
-    """Calculates position size based on risk and caps it by available margin."""
+    # ... (Unchanged, uses exchange_manager.client)
     if any(p is None or p <= 0 for p in [equity, available_margin, risk_percent, entry_price, stop_loss_price, leverage]):
         return 0.0
     try:
@@ -73,8 +72,6 @@ def calculate_position_size(equity, available_margin, risk_percent, entry_price,
         price_delta = abs(entry_price - stop_loss_price)
         risk_based_size = amount_to_risk / price_delta if price_delta > 0 else 0
         
-        # Max position value based on margin and leverage
-        # Using a safety margin of 95% of available margin * leverage
         max_position_value = available_margin * leverage * 0.95
         margin_based_size = max_position_value / entry_price
         
@@ -83,15 +80,14 @@ def calculate_position_size(equity, available_margin, risk_percent, entry_price,
         if final_size < risk_based_size and risk_based_size > 0:
             add_log(f"⚠️ Risk-based size ({risk_based_size:.4f}) unaffordable. Capped by margin to {final_size:.4f}.", symbol)
         
-        # Format size to exchange's precision
         return float(exchange_manager.client.amount_to_precision(symbol, final_size))
     except Exception as e:
         add_log(f"❌ Error in calculate_position_size for {symbol}: {e}", symbol)
         return 0.0
 
-# --- Advanced Trigger & State Management (Keep this class for logic isolation) ---
+# --- DynamicTriggerManager (Unchanged) ---
 class DynamicTriggerManager:
-    """Manages complex, multi-scenario triggers set by the AI."""
+    # ... (Unchanged)
     def __init__(self, symbol: str):
         self.triggers: List[Dict] = []
         self.timeout = None
@@ -99,7 +95,6 @@ class DynamicTriggerManager:
         self.symbol = symbol
 
     def set_triggers(self, decision: Dict):
-        """Sets new triggers from an AI decision."""
         if decision.get('action') == 'WAIT' and 'triggers' in decision and isinstance(decision['triggers'], list):
             self.triggers = decision['triggers']
             self.timeout = time.time() + decision.get('trigger_timeout', 1800)
@@ -107,24 +102,19 @@ class DynamicTriggerManager:
         else:
             self.triggers = []
             self.timeout = None
-            # Reset last check time to ensure next interval check is on time
             self._last_check = time.time()
 
     def check_triggers(self, df_5m: pd.DataFrame) -> Tuple[bool, str]:
-        """Checks if any active trigger is met. Returns (is_triggered, reason)."""
         if not self.triggers:
-            # Check for default monitoring interval if no explicit WAIT triggers
             if time.time() > self._last_check + config.DEFAULT_MONITORING_INTERVAL:
                 self._last_check = time.time()
                 return True, "Scheduled Analysis"
             return False, ""
 
-        # Check for trigger timeout
         if self.timeout and time.time() > self.timeout:
             add_log("⏳ Trigger timeout reached.", self.symbol)
             return True, "Timeout"
 
-        # Check explicit triggers
         for trigger in self.triggers:
             try:
                 if self._is_condition_met(trigger, df_5m):
@@ -136,12 +126,10 @@ class DynamicTriggerManager:
         return False, ""
     
     def _is_condition_met(self, trigger: Dict, df_5m: pd.DataFrame) -> bool:
-        """Evaluates a single trigger object."""
         trigger_type = trigger.get('type')
         level = trigger.get('level')
         direction = trigger.get('direction')
         
-        # Ensure we have enough data and valid parameters
         if df_5m.empty or level is None or direction is None:
             return False
 
@@ -151,13 +139,11 @@ class DynamicTriggerManager:
             if direction == 'BELOW' and latest_candle['low'] <= level: return True
         
         elif trigger_type == 'RSI_CROSS':
-            # Calculate RSI on the fly for the latest candle
             current_rsi = ta.rsi(df_5m['close'], length=14).iloc[-1]
             if direction == 'ABOVE' and current_rsi >= level: return True
             if direction == 'BELOW' and current_rsi <= level: return True
         
         elif trigger_type == 'ADX_VALUE':
-            # Calculate ADX on the fly for the latest candle
             adx_data = ta.adx(df_5m['high'], df_5m['low'], df_5m['close'], length=14)
             current_adx = adx_data['ADX_14'].iloc[-1]
             if direction == 'ABOVE' and current_adx >= level: return True
@@ -165,244 +151,196 @@ class DynamicTriggerManager:
 
         return False
 
-# --- Core Asynchronous Logic (One Symbol per Instance) ---
-async def symbol_main_loop(symbol: str, exchange: ExchangeManager, executor: ProcessPoolExecutor):
-    """The main trading loop for a single symbol, executed in its own process."""
+# --- Main Bot Execution Loop (Synchronous) ---
+def main():
+    global AI_CLIENT
     
-    # Initialize AI Client for this process's event loop
-    ai_client = await init_ai_client()
-    if not ai_client:
-        add_log(f"❌ Aborting {symbol} bot due to AI client failure.", symbol)
-        return
+    # 1. Database Setup
+    setup_database()
     
-    # Global state for this process
-    initial_context = load_market_context(symbol)
-    SYMBOL_BOT_STATE[symbol] = {
-        "trigger_manager": DynamicTriggerManager(symbol), 
-        "market_context": initial_context, 
-        "last_decision": {},
-        "trade_state": {"is_trailing_active": False, "current_stop_loss": None}, 
-        "was_in_position": False
-    }
-    symbol_state = SYMBOL_BOT_STATE[symbol]
-
-    # Initial data hydration (now fetch for a single symbol)
-    add_log(f"💧 Hydrating historical data for {symbol}...", symbol)
-    klines_map = await exchange.fetch_historical_klines(symbol, config.TIMEFRAME, 500)
-    klines = klines_map.get(symbol, [])
-    if klines:
-        HISTORICAL_DATA[symbol] = process_klines(klines)
-        add_log(f"✅ Data hydration complete for {symbol}.", symbol)
-    else:
-        add_log(f"⚠️ Initial data fetch failed for {symbol}. Cannot start trading.", symbol)
-        return
-
-    while True:
-        try:
-            # 1. Fetch Account Vitals and Positions
-            vitals = await exchange.get_account_vitals()
-            all_positions = await exchange.fetch_positions([symbol]) # Fetch only for this symbol
-            pos = all_positions[0] if all_positions else {"side": None}
-            is_in_position = pos.get('side') is not None
-            current_price = await exchange.get_current_mark_price(symbol)
-            
-            # 2. Position Close & Learning Cycle
-            if symbol_state['was_in_position'] and not is_in_position:
-                add_log(f"📉 Position closed for {symbol}. Triggering learning cycle.", symbol)
-                # Fetch recent trades to calculate PNL for learning
-                trades = await exchange.fetch_account_trade_list(symbol, limit=5)
-                # Assuming the most recent trade is the closing trade (complex on Binance, simple approximation)
-                if trades:
-                    # In a real system, realizedPNL would be better tracked, but we use the first trade's PNL here as a heuristic
-                    pnl = float(trades[0].get('info', {}).get('realizedPnl', 0)) if trades[0].get('info', {}).get('realizedPnl') else 0.0
-                    entry_reason = symbol_state['last_decision'].get('reasoning', 'N/A')
-                    trade_summary = f"Outcome: {'WIN' if pnl > 0 else 'LOSS'}, PNL: {pnl:.2f} USDT. Entry Reason: {entry_reason}"
-                    await summarize_and_learn(trade_summary, symbol)
-                
-                # Reset trade state
-                symbol_state["trade_state"] = {"is_trailing_active": False, "current_stop_loss": None}
-            symbol_state['was_in_position'] = is_in_position
-            
-            # 3. Trailing Stop / Breakeven Update (High-Frequency Check)
-            if is_in_position and symbol_state['last_decision'].get('action') == 'OPEN_POSITION':
-                activation_price = symbol_state['last_decision'].get('trailing_activation_price')
-                
-                # Check for Breakeven activation
-                if activation_price and not symbol_state['trade_state']['is_trailing_active']:
-                    if (pos['side'] == 'LONG' and current_price >= activation_price) or \
-                       (pos['side'] == 'SHORT' and current_price <= activation_price):
-                        add_log(f"🔒 Breakeven Trigger for {symbol}. Moving SL to entry: {pos['entry_price']}.", symbol)
-                        res = await exchange.modify_protective_orders(symbol, pos['side'], pos['quantity'], new_sl=pos['entry_price'])
-                        if res['status'] == 'success':
-                            symbol_state['trade_state']['is_trailing_active'] = True
-                            symbol_state['trade_state']['current_stop_loss'] = pos['entry_price']
-                
-                # TODO: Implement full Trailing Stop Logic here if 'is_trailing_active' is True and current_price allows a tighter SL
-
-            # 4. Data Refresh
-            # Fetch the latest 1-min/5-min candle to keep data up-to-date
-            df_update_map = await exchange.fetch_historical_klines(symbol, config.TIMEFRAME, limit=1)
-            df_5m_update = process_klines(df_update_map.get(symbol, []))
-            if not df_5m_update.empty:
-                # Append new data and keep the frame size capped
-                HISTORICAL_DATA[symbol] = pd.concat([HISTORICAL_DATA[symbol], df_5m_update]).drop_duplicates()
-                if len(HISTORICAL_DATA[symbol]) > 500: 
-                    HISTORICAL_DATA[symbol] = HISTORICAL_DATA[symbol].iloc[-500:]
-
-            # 5. Check Triggers for AI Analysis
-            if symbol not in HISTORICAL_DATA or HISTORICAL_DATA[symbol].empty: 
-                await asyncio.sleep(config.API_RETRY_DELAY) # Wait and re-try in case of data failure
-                continue
-            
-            is_triggered, reason = symbol_state['trigger_manager'].check_triggers(HISTORICAL_DATA[symbol])
-
-            # 6. AI Decision Making
-            if is_triggered:
-                add_log(f"Analysis for {symbol} triggered by: {reason}", symbol)
-                
-                analysis_bundle = analyze_freqtrade_data(HISTORICAL_DATA[symbol], current_price)
-                
-                base_symbol = symbol.split('/')[0]
-                news_text = get_news_from_rss(base_symbol)
-                # Run sentiment analysis in the ProcessPoolExecutor
-                sentiment_score = await get_sentiment_score_async(executor, news_text)
-                
-                pos_report = f"Side: {pos.get('side', 'FLAT')}, Entry: {pos.get('entry_price', 0):.4f}"
-                context_summary = json.dumps(symbol_state['market_context'])
-                
-                decision, new_context = await get_ai_decision(
-                    analysis_bundle, pos_report, context_summary, vitals['total_equity'], sentiment_score
-                )
-                
-                # 7. Execute AI Action
-                if new_context: symbol_state['market_context'] = new_context
-                
-                if decision and decision.get('action'):
-                    symbol_state['last_decision'] = decision
-                    action = decision['action']
-                    
-                    if action == 'OPEN_POSITION' and not is_in_position:
-                        # With multi-process, we simplify this: only one position per symbol process.
-                        # Global max positions check is removed.
-                        qty = calculate_position_size(vitals['total_equity'], vitals['available_margin'], decision.get('risk_percent', 0), decision.get('entry_price', 0), decision.get('stop_loss', 0), decision.get('leverage', 0), symbol, exchange)
-                        
-                        if qty > 0:
-                            res = await exchange.place_limit_order(symbol, decision['decision'], qty, decision['entry_price'])
-                            if res['status'] == 'success':
-                                add_log(f"✅ Entry order placed for {symbol}. Setting SL/TP.", symbol)
-                                await asyncio.sleep(2) # Give a small pause
-                                # The quantity here should be the *filled* quantity, but since we are placing a limit order, we assume the intended size for the protective order.
-                                await exchange.modify_protective_orders(symbol, decision['decision'], qty, decision.get('stop_loss'), decision.get('take_profit'))
-                                symbol_state['trade_state']['current_stop_loss'] = decision.get('stop_loss')
-                            else:
-                                add_log(f"❌ Failed to place entry order: {res['message']}", symbol)
-                        else:
-                            add_log(f"⚠️ Calculated position size is zero. Skipping trade.", symbol)
-                            
-                    elif action == 'CLOSE_POSITION' and is_in_position:
-                        await exchange.close_position_market(symbol, pos)
-                        add_log(f"✅ Position market closed for {symbol}.", symbol)
-                        
-                    elif action == 'MODIFY_POSITION' and is_in_position:
-                        res = await exchange.modify_protective_orders(
-                            symbol, pos['side'], pos['quantity'], 
-                            decision.get('new_stop_loss'), decision.get('new_take_profit')
-                        )
-                        if res['status'] == 'success':
-                            add_log(f"✅ Protective orders modified for {symbol}.", symbol)
-                            if decision.get('new_stop_loss'):
-                                symbol_state['trade_state']['current_stop_loss'] = decision.get('new_stop_loss')
-                        
-                    # Always set new triggers/wait state after an analysis is performed
-                    symbol_state['trigger_manager'].set_triggers(decision)
-            
-            # 8. Save Context and Wait
-            save_market_context(symbol, symbol_state['market_context'])
-            await asyncio.sleep(config.FAST_CHECK_INTERVAL) 
-
-        except asyncio.CancelledError:
-            add_log(f"🛑 {symbol} loop cancelled.", symbol)
-            break
-        except Exception as e:
-            add_log(f"💥 CRITICAL ERROR in {symbol} engine loop: {traceback.format_exc()}", symbol)
-            await asyncio.sleep(config.API_RETRY_DELAY) # Wait before retrying loop
-
-# --- Multi-Process Management ---
-def run_symbol_bot(symbol: str):
-    """Entry point for each trading process."""
-    add_log(f"Starting dedicated bot process for {symbol}...", symbol)
+    # 2. Start Web Dashboard in a separate thread
+    dashboard_thread = threading.Thread(target=start_dashboard, daemon=True)
+    dashboard_thread.start()
+    
+    # 3. Initialize Exchange and AI
     exchange = ExchangeManager()
+    exchange.load_markets()
     
-    # We must start the ProcessPoolExecutor for FinBERT inside the process
-    # This keeps the sentiment analysis isolated and non-blocking.
-    with ProcessPoolExecutor(max_workers=2, initializer=init_finbert_process) as executor:
-        try:
-            # Run the main asynchronous loop inside this process
-            asyncio.run(exchange.load_markets())
-            asyncio.run(symbol_main_loop(symbol, exchange, executor))
-        except KeyboardInterrupt:
-            add_log(f"Keyboard Interrupt in {symbol} process.", symbol)
-        except Exception as e:
-            add_log(f"Unhandled error in {symbol} process: {e}", symbol)
-        finally:
-            add_log(f"Shutting down {symbol} process.", symbol)
-            asyncio.run(exchange.close_client())
+    AI_CLIENT = init_ai_client()
+    if not AI_CLIENT: return
 
-def main_process_manager():
-    """Manages the creation and cleanup of all symbol processes."""
-    processes = []
-    
-    # Simple signal handler for clean shutdown
-    def signal_handler(sig, frame):
-        print("\n🛑 Received shutdown signal. Terminating all symbol processes...")
-        for p in processes:
-            if p.is_alive():
-                p.terminate()
-                p.join()
-        sys.exit(0)
+    init_finbert_analyzer()
 
-    # Set up signal handling
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    print("--- Multi-Process Bot Manager Started ---")
-    
-    # Create and start a new process for each symbol
+    # 4. Initialize state for all symbols
     for symbol in config.SYMBOLS_TO_TRADE:
-        p = mp.Process(target=run_symbol_bot, args=(symbol,))
-        processes.append(p)
-        p.start()
-        print(f"✅ Launched process {p.pid} for {symbol}.")
-        time.sleep(1) # Stagger start-up to avoid API key rate limits on initialization
+        BOT_STATE[symbol] = {
+            "trigger_manager": DynamicTriggerManager(symbol), 
+            "market_context": load_market_context(symbol), 
+            "last_decision": {},
+            "trade_state": {"is_trailing_active": False, "current_stop_loss": None}, 
+            "was_in_position": False,
+            "current_position": {"side": None} # Placeholder for current position data
+        }
 
-    # Main process waits for all child processes to finish (or for a signal)
-    try:
-        while True:
-            # Check status of child processes
-            all_dead = True
-            for p in processes:
-                if p.is_alive():
-                    all_dead = False
-                elif p.exitcode is not None and p.exitcode != 0:
-                    print(f"⚠️ Process for a symbol died unexpectedly with exit code {p.exitcode}. Restarting is an option here, but for now, we just log it.")
+    add_log("💧 Hydrating historical data for all symbols sequentially...")
+    initial_klines_map = exchange.fetch_historical_klines(
+        config.SYMBOLS_TO_TRADE, 
+        config.TIMEFRAME, 
+        500
+    )
+    for symbol, klines in initial_klines_map.items():
+        if klines: 
+            HISTORICAL_DATA[symbol] = process_klines(klines)
+        else:
+            add_log(f"⚠️ Could not hydrate data for {symbol}. It will be skipped until data is available.", "SYSTEM")
+    add_log("✅ Data hydration complete.")
+
+    add_log(f"🚀 Bot engine is live for symbols: {', '.join(config.SYMBOLS_TO_TRADE)}. Polling every {config.FAST_CHECK_INTERVAL}s.")
+    
+    while True:
+        start_time = time.time()
+        try:
+            vitals = exchange.get_account_vitals()
+            all_positions = exchange.fetch_positions(config.SYMBOLS_TO_TRADE)
+            open_positions_map = {pos['symbol']: pos for pos in all_positions}
             
-            if all_dead and processes:
-                print("All child processes have terminated. Exiting manager.")
-                break
+            latest_klines_map = exchange.fetch_historical_klines(config.SYMBOLS_TO_TRADE, config.TIMEFRAME, limit=2)
+            
+            for symbol in config.SYMBOLS_TO_TRADE:
+                if symbol not in BOT_STATE: continue
+                
+                symbol_state = BOT_STATE[symbol]
+                pos = open_positions_map.get(symbol, {"side": None})
+                is_in_position = pos.get('side') is not None
+                
+                # Update current position data in state for DB logging
+                symbol_state['current_position'] = pos
 
-            time.sleep(5)
-    except Exception:
-        # Pass to allow signal handler to catch the KeyboardInterrupt/Termination
-        pass
-    finally:
-        # Final cleanup for any lingering processes
-        signal_handler(None, None)
+                # 1. Update Historical Data
+                df_5m_update = process_klines(latest_klines_map.get(symbol, []))
+                if not df_5m_update.empty:
+                    HISTORICAL_DATA[symbol] = df_5m_update.combine_first(HISTORICAL_DATA.get(symbol, pd.DataFrame()))
+                    if len(HISTORICAL_DATA[symbol]) > 500: 
+                        HISTORICAL_DATA[symbol] = HISTORICAL_DATA[symbol].iloc[-500:].copy()
+
+                if symbol not in HISTORICAL_DATA or HISTORICAL_DATA[symbol].empty: continue
+                
+                current_price = exchange.get_current_mark_price(symbol)
+
+                # 2. Position Close & Learning Cycle
+                if symbol_state['was_in_position'] and not is_in_position:
+                    add_log(f"📉 Position closed for {symbol}. Triggering learning cycle.", symbol)
+                    trades = exchange.fetch_account_trade_list(symbol, limit=5)
+                    
+                    # Log trade to DB
+                    if trades:
+                        pnl = float(trades[0].get('info', {}).get('realizedPnl', 0)) if trades[0].get('info', {}).get('realizedPnl') else 0.0
+                        entry_reason = symbol_state['last_decision'].get('reasoning', 'N/A')
+                        
+                        # Approximate exit price and PNL% for logging (requires more complex logic for true values)
+                        entry_price = symbol_state['current_position'].get('entry_price', 0)
+                        quantity = symbol_state['current_position'].get('quantity', 0)
+                        exit_price = current_price # Approximation
+                        pnl_pct = (pnl / (entry_price * quantity)) if entry_price * quantity else 0.0
+                        
+                        log_trade(symbol, symbol_state['current_position'].get('side', 'UNKNOWN'), entry_price, exit_price, quantity, pnl, pnl_pct, entry_reason)
+                        
+                        trade_summary = f"Outcome: {'WIN' if pnl > 0 else 'LOSS'}, PNL: {pnl:.2f} USDT. Entry Reason: {entry_reason}"
+                        summarize_and_learn_sync(trade_summary, symbol)
+                        
+                    symbol_state["trade_state"] = {"is_trailing_active": False, "current_stop_loss": None}
+                symbol_state['was_in_position'] = is_in_position
+                
+                # 3. Trailing Stop / Breakeven Update
+                if is_in_position and symbol_state['last_decision'].get('action') == 'OPEN_POSITION':
+                    activation_price = symbol_state['last_decision'].get('trailing_activation_price')
+                    if activation_price and not symbol_state['trade_state']['is_trailing_active']:
+                        if (pos['side'] == 'LONG' and current_price >= activation_price) or \
+                           (pos['side'] == 'SHORT' and current_price <= activation_price):
+                            add_log(f"🔒 Breakeven Trigger for {symbol}. Moving SL to entry: {pos['entry_price']}.", symbol)
+                            res = exchange.modify_protective_orders(symbol, pos['side'], pos['quantity'], new_sl=pos['entry_price'])
+                            if res['status'] == 'success':
+                                symbol_state['trade_state']['is_trailing_active'] = True
+                                symbol_state['trade_state']['current_stop_loss'] = pos['entry_price']
+
+                # 4. Check Triggers for AI Analysis
+                is_triggered, reason = symbol_state['trigger_manager'].check_triggers(HISTORICAL_DATA[symbol])
+
+                # 5. AI Decision Making
+                if is_triggered:
+                    add_log(f"Analysis for {symbol} triggered by: {reason}", symbol)
+                    
+                    analysis_bundle = analyze_freqtrade_data(HISTORICAL_DATA[symbol], current_price)
+                    
+                    base_symbol = symbol.split('/')[0]
+                    news_text = get_news_from_rss(base_symbol)
+                    sentiment_score = get_sentiment_score_sync(news_text)
+                    
+                    pos_report = f"Side: {pos.get('side', 'FLAT')}, Entry: {pos.get('entry_price', 0):.4f}"
+                    context_summary = json.dumps(symbol_state['market_context'])
+                    
+                    decision, new_context = get_ai_decision_sync(
+                        analysis_bundle, pos_report, context_summary, vitals['total_equity'], sentiment_score
+                    )
+                    
+                    # 6. Execute AI Action
+                    if new_context: symbol_state['market_context'] = new_context
+                    
+                    if decision and decision.get('action'):
+                        symbol_state['last_decision'] = decision
+                        action = decision['action']
+                        
+                        if action == 'OPEN_POSITION' and not is_in_position:
+                            if len(open_positions_map) >= config.MAX_CONCURRENT_POSITIONS:
+                                add_log(f"🚨 Max positions reached. Skipping open for {symbol}.", symbol)
+                            else:
+                                qty = calculate_position_size(vitals['total_equity'], vitals['available_margin'], decision.get('risk_percent', 0), decision.get('entry_price', 0), decision.get('stop_loss', 0), decision.get('leverage', 0), symbol, exchange)
+                                
+                                if qty > 0:
+                                    res = exchange.place_limit_order(symbol, decision['decision'], qty, decision['entry_price'])
+                                    if res['status'] == 'success':
+                                        add_log(f"✅ Entry order placed for {symbol}. Setting SL/TP.", symbol)
+                                        time.sleep(2) 
+                                        exchange.modify_protective_orders(symbol, decision['decision'], qty, decision.get('stop_loss'), decision.get('take_profit'))
+                                        symbol_state['trade_state']['current_stop_loss'] = decision.get('stop_loss')
+                                    else:
+                                        add_log(f"❌ Failed to place entry order: {res['message']}", symbol)
+                                else:
+                                    add_log(f"⚠️ Calculated position size is zero. Skipping trade.", symbol)
+                                    
+                        elif action == 'CLOSE_POSITION' and is_in_position:
+                            exchange.close_position_market(symbol, pos)
+                            
+                        elif action == 'MODIFY_POSITION' and is_in_position:
+                            res = exchange.modify_protective_orders(
+                                symbol, pos['side'], pos['quantity'], 
+                                decision.get('new_stop_loss'), decision.get('new_take_profit')
+                            )
+                            if res['status'] == 'success' and decision.get('new_stop_loss'):
+                                symbol_state['trade_state']['current_stop_loss'] = decision.get('new_stop_loss')
+                            
+                        symbol_state['trigger_manager'].set_triggers(decision)
+            
+            # 7. Save all state to DB
+            save_market_context()
+            
+        except Exception:
+            add_log(f"💥 CRITICAL ERROR in main loop: {traceback.format_exc()}", "SYSTEM")
+            time.sleep(config.API_RETRY_DELAY) 
+        
+        # Calculate time spent and sleep for the remainder of the polling interval
+        time_spent = time.time() - start_time
+        sleep_time = max(0, config.FAST_CHECK_INTERVAL - time_spent)
+        time.sleep(sleep_time)
+
+    exchange.close_client()
+    add_log("🛑 Bot shutting down.")
 
 if __name__ == '__main__':
-    # Set the start method for multiprocessing (important on some OS/platforms)
+    print("--- Single-Process Synchronous Bot Manager Started ---")
     try:
-        mp.set_start_method('spawn', force=True)
-    except ValueError:
-        pass # Ignore if already set or not necessary
-
-    main_process_manager()
+        main()
+    except KeyboardInterrupt:
+        print("\n🛑 User interrupted. Shutting down.")
+    except Exception as e:
+        print(f"\n🛑 CRITICAL UNHANDLED EXCEPTION: {e}")
