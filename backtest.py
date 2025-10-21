@@ -293,65 +293,84 @@ class SimulatedExchange:
 
 def create_backtest_analysis_bundle(df_slice):
     """
-    Creates an enhanced analysis bundle using technical data and explicit momentum signals.
+    Creates an enhanced analysis bundle for multiple timeframes by resampling the 5m data.
     """
-    if len(df_slice) < 50: # Minimum data needed for good indicators
+    # Use a deeper slice to ensure indicators have space to calculate (e.g., last 200 candles)
+    if len(df_slice) < 200: 
         return "Not enough data for comprehensive analysis."
 
     current_price = df_slice.iloc[-1]['close']
     report = f"### 0. Current Market Price (Anchor)\n- **Current Price:** {current_price:.4f} USDT\n\n"
 
-    # --- 1. Calculate Standard Indicators ---
-    df_slice['EMA_20'] = ta.ema(df_slice['close'], length=20)
-    df_slice['EMA_50'] = ta.ema(df_slice['close'], length=50)
-    df_slice['RSI_14'] = ta.rsi(df_slice['close'], length=14)
-    # Using the standard pandas ta library for MACD and ADX (if available in your simplified setup)
-    macd = df_slice.ta.macd(close=df_slice['close'])
-    df_slice = pd.concat([df_slice, macd], axis=1) 
-    adx_df = df_slice.ta.adx(length=14)
-    df_slice['ADX_14'] = adx_df['ADX_14'] if 'ADX_14' in adx_df.columns else 0
+    # --- Timeframe Definitions ---
+    # Resample all slices to ensure the time series structure is consistent
+    timeframes = {
+        '5m': df_slice,
+        # Resample the 5m data to 15m and 1h using OHLC to preserve price action info
+        '15m': df_slice[['open', 'high', 'low', 'close']].resample('15Min').agg({
+            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
+        }).dropna(),
+        '1h': df_slice[['open', 'high', 'low', 'close']].resample('1h').agg({
+            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
+        }).dropna()
+    }
     
-    latest = df_slice.iloc[-1]
+    # --- Multi-Timeframe Analysis ---
+    report += "### 1. Multi-Timeframe Indicator Status\n"
     
-    # --- 2. Calculate Momentum and Price Action Metrics ---
+    for tf_name, df_tf in timeframes.items():
+        if df_tf.empty:
+            report += f"--- Analysis Report ({tf_name}) ---\n"
+            report += f"Error: Insufficient data to form {tf_name} candle.\n"
+            continue
+
+        # Extract the close series explicitly
+        close_series = df_tf['close']
+        
+        # --- Indicator Calculations ---
+        # NOTE: We use .tail(1).iloc[0] to safely extract the single final value
+        
+        # Standard Indicators
+        ema_20 = ta.ema(close_series, length=20).tail(1).iloc[0] if len(close_series) >= 20 else 0.0
+        ema_50 = ta.ema(close_series, length=50).tail(1).iloc[0] if len(close_series) >= 50 else 0.0
+        rsi_14 = ta.rsi(close_series, length=14).tail(1).iloc[0] if len(close_series) >= 14 else 50.0
+        
+        # Trend Strength (ADX)
+        adx_df = df_tf.ta.adx(length=14)
+        adx_14 = adx_df['ADX_14'].iloc[-1] if 'ADX_14' in adx_df.columns and len(adx_df) > 0 else 0.0
+        
+        # --- Generate Explicit Signals ---
+        
+        # Trend Status
+        if ema_20 > ema_50 and ema_50 > 0:
+            trend_status = f"BULLISH (EMA20 {ema_20:.4f} > EMA50 {ema_50:.4f})"
+        elif ema_20 < ema_50 and ema_50 > 0:
+            trend_status = f"BEARISH (EMA20 {ema_20:.4f} < EMA50 {ema_50:.4f})"
+        else:
+            trend_status = "RANGING/FLAT"
+
+        # Overbought/Oversold Check
+        oversold_overbought = "OVERBOUGHT (RSI > 70)" if rsi_14 > 70 else ("OVERSOLD (RSI < 30)" if rsi_14 < 30 else "NEUTRAL")
+
+        
+        # --- Build the TF Report ---
+
+        report += f"--- Analysis Report ({tf_name}) ---\n"
+        report += f"Close Price: {close_series.iloc[-1]:.4f}\n"
+        report += f"Primary Trend (EMA 20/50): {trend_status}\n"
+        report += f"Momentum Status (RSI): {oversold_overbought}\n"
+        report += f"Trend Strength (ADX): {adx_14:.2f}\n"
+
+    # --- 4. Immediate Price Action (5m Execution) ---
     
-    # Last 3 candles for momentum check
-    last_3_candles = df_slice.tail(3)
+    latest_5m = timeframes['5m'].iloc[-1]
+    last_3_candles = timeframes['5m'].tail(3)
     net_momentum = (last_3_candles['close'] - last_3_candles['open']).sum()
-    last_candle_type = "BULLISH (Close > Open)" if latest['close'] > latest['open'] else "BEARISH (Close < Open)"
-    
-    # Volatility Check
-    atr_14 = ta.atr(df_slice['high'], df_slice['low'], df_slice['close'], length=14).iloc[-1]
-    
-    # --- 3. Generate Explicit Signals ---
-    
-    # Trend Status
-    ema_20 = latest.get('EMA_20', 0)
-    ema_50 = latest.get('EMA_50', 0)
-    if ema_20 > ema_50:
-        trend_status = f"BULLISH (EMA20 {ema_20:.4f} > EMA50 {ema_50:.4f})"
-    elif ema_20 < ema_50:
-        trend_status = f"BEARISH (EMA20 {ema_20:.4f} < EMA50 {ema_50:.4f})"
-    else:
-        trend_status = "RANGING/FLAT"
+    last_candle_type = "BULLISH" if latest_5m['close'] > latest_5m['open'] else "BEARISH"
 
-    # Overbought/Oversold Check
-    rsi_14 = latest.get('RSI_14', 50)
-    oversold_overbought = "OVERBOUGHT (RSI > 70)" if rsi_14 > 70 else ("OVERSOLD (RSI < 30)" if rsi_14 < 30 else "NEUTRAL")
-
-    
-    # --- 4. Build the Report ---
-
-    report += "### 1. Key Indicator Status\n"
-    report += f"- Primary Trend (EMA 20/50): {trend_status}\n"
-    report += f"- Momentum Status (RSI): {oversold_overbought}\n"
-    report += f"- Trend Strength (ADX): {latest.get('ADX_14', 0):.2f}\n"
-    report += f"- Volatility (ATR): {atr_14:.4f}\n"
-
-    report += "\n### 2. Immediate Price Action\n"
+    report += "\n### 2. Immediate Price Action (5m Execution)\n"
     report += f"- Last Candle Type: {last_candle_type}\n"
     report += f"- Net 3-Candle Momentum: {net_momentum:.4f}\n"
-    report += f"- MACD Histogram: {latest.get('MACDH_12_26_9', 0):.4f}\n"
     
     return report
 
@@ -497,8 +516,8 @@ def run_backtest(historical_data, sim_exchange):
 if __name__ == '__main__':
     # Define backtest parameters here
     backtest_symbol = "SOLUSDT"
-    start_date = "1 June, 2025"
-    end_date = "15 June, 2025" # A shorter period is better for initial tests due to API call speed
+    start_date = "19 October, 2025"
+    end_date = "20 October, 2025" # A shorter period is better for initial tests due to API call speed
     
     # 1. Download data
     hist_data = get_historical_data(

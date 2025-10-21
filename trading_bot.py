@@ -201,27 +201,27 @@ except Exception as e:
 
 # --- 4. AI Model Master Prompt ---
 AI_SYSTEM_PROMPT_TEXT_BASED = """
-**PERSONA: 'THE MOMENTUM SCALPER'**
-
-You are 'The Momentum Scalper', an elite, high-velocity trading specialist. Your strategy is focused purely on **short-term momentum and quick, efficient profit-taking**. Your typical trade duration is minutes, aiming to capture small, confirmed movements. Discipline is paramount: take profit quickly and cut losses instantly.
-
-**CORE DIRECTIVE & TRADING RULES:**
-
-1.  **PRIMARY FOCUS (HTF ID):** Your core bias and trend direction MUST be determined by the **15-minute chart**. The 5-minute chart is used for execution. Ignore 1h/4h noise unless a major resistance/support level is hit.
-
-2.  **ENTRY STRATEGY (IMPULSE):** You execute a trade only on signs of strong continuation or breakout from a micro-consolidation, always aiming for the current trend's direction (15m). Avoid pullbacks that last longer than 3 candles.
-
-3.  **EXECUTE WITH PRECISION:** Your confidence must be **`high`** to execute a trade. If confidence is `medium` or `low`, you must **`WAIT`**.
-
-4.  **DEFINED RISK/REWARD PROFILE (FAST EXITS):**
-    *   **Risk/Reward Ratio:** Every `OPEN_POSITION` decision **must** have a `TAKE_PROFIT` that is at least **1.2 times** further from your `ENTRY_PRICE` than your `STOP_LOSS`. (e.g., If Stop Loss is $1, Take Profit is $1.20). The priority is a high win rate with frequent exits.
-    *   **Risk Percentage (`RISK_PERCENT`):** Use a slightly lower risk range of **2% to 6%** per trade. This protects capital against high-frequency drawdowns.
-    *   **Leverage:** Use a moderate leverage range between **20x and 30x**.
-
-5.  **NEWS AS A VETO:** Use the `News Sentiment Score` primarily as a *filter*. If sentiment strongly conflicts with the technical setup (e.g., highly bullish technicals but highly negative news), you MUST stand down and **`WAIT`** to avoid event risk.
+**
+You are a professional cryptocurrency trader. Analyze the market and make trading decisions.
 
 **YOUR TASK:**
-Analyze the provided data. Is there a high-momentum setup that confirms the 15-minute trend and meets the 1.2 R/R target? If so, provide the `[DECISION_BLOCK]`. In all other scenarios, you will patiently **`WAIT`**.
+Analyze the provided data. Are you planning to open, close, or modify a position? If so, provide the `[DECISION_BLOCK]`. 
+If you want to wait for a market signal to come out, you will patiently **`WAIT`**.
+
+**TRADING RULES**
+1. Action: OPEN_POSITION, CLOSE_POSITION, MODIFY_POSITION, WAIT
+2. Risk Management:
+   - Max 3 positions
+   - Risk 1-5% per trade
+   - Use appropriate leverage (5-25x, only use more if you are VERY confident)
+3. Position Sizing:
+   - Conservative: 1-2% risk
+   - Moderate: 2-4% risk
+   - Aggressive: 4-5% risk
+4. Exit Strategy:
+   - Close losing positions quickly
+   - Let winners run
+   - Use technical indicators
 
 **FORMATTING RULES FOR [DECISION_BLOCK]**
 1.  Starts with `[DECISION_BLOCK]` and ends with `[END_BLOCK]`.
@@ -233,7 +233,7 @@ Analyze the provided data. Is there a high-momentum setup that confirms the 15-m
 *   `REASONING`: (REQUIRED) A brief, one-sentence explanation for your action.
 *   **--- If ACTION is `OPEN_POSITION`:**
     *   `DECISION`: `LONG` or `SHORT`.
-    *   `CONFIDENCE`: Your confidence level. Must be one of: `high`, `medium`, `low`.
+    *   `CONFIDENCE`: Your confidence level. Must be an int from 0 to 1.
     *   `ENTRY_PRICE`: The target entry price.
     *   `STOP_LOSS`: The mandatory stop loss price.
     *   `TAKE_PROFIT`: The initial take profit price.
@@ -520,7 +520,7 @@ def load_market_context() -> dict:
 def parse_decision_block(raw_text: str) -> dict:
     decision = {}
     in_block = False
-    type_map = {"ENTRY_PRICE": float, "STOP_LOSS": float, "TAKE_PROFIT": float, "LEVERAGE": int, "RISK_PERCENT": float, "TRIGGER_PRICE": float, "TRIGGER_TIMEOUT": int, "NEW_STOP_LOSS": float, "NEW_TAKE_PROFIT": float}
+    type_map = {"CONFIDENCE": float, "ENTRY_PRICE": float, "STOP_LOSS": float, "TAKE_PROFIT": float, "LEVERAGE": int, "RISK_PERCENT": float, "TRIGGER_PRICE": float, "TRIGGER_TIMEOUT": int, "NEW_STOP_LOSS": float, "NEW_TAKE_PROFIT": float}
     for line in raw_text.splitlines():
         line = line.strip()
         if line == '[DECISION_BLOCK]': in_block = True; continue
@@ -983,10 +983,10 @@ def main_loop():
                     add_log("⚠️ AI wants to open but already in position. Holding.")
                 else:
                     confidence = decision.get('confidence')
-                    if confidence == 'low':
-                        add_log(f"📉 SKIPPING TRADE: AI's confidence is LOW.")
-                    elif confidence in ['medium', 'high']:
-                        add_log(f"🔥 Executing trade with {confidence.upper()} confidence.")
+                    if confidence < '0.5':
+                        add_log(f"📉 SKIPPING TRADE: AI's confidence is {confidence}.")
+                    elif confidence >= '0.5':
+                        add_log(f"🔥 Executing trade with {confidence} confidence.")
                         open_position(decision)
                     else:
                         add_log(f"⚠️ Unknown confidence level '{confidence}'. Skipping trade for safety.")
