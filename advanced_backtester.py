@@ -35,16 +35,16 @@ class BinanceData(bt.feeds.PandasData):
 # --- The Live AI Backtesting Strategy ---
 class LiveAIStrategy(bt.Strategy):
     """
-    This strategy makes a LIVE API call to the AI on each candle to get a decision.
-    It uses the AI's risk parameter for sizing and logs trades to the database.
-    WARNING: This will be VERY slow due to network latency for each API call.
+    This strategy makes a LIVE API call to the AI on each candle and correctly
+    manages the trade lifecycle based on the AI's response.
     """
     def __init__(self):
         self.d5m = self.datas[0]
-        self.last_decision = {}
         self.order = None
+        # State variables that mimic the live bot
         self.trade_entry_price = 0
         self.trade_entry_reason = ""
+        self.trade_side = "" # "LONG" or "SHORT"
         self.active_sl_tp = {} 
 
     def log(self, txt, dt=None):
@@ -55,8 +55,10 @@ class LiveAIStrategy(bt.Strategy):
         if trade.isclosed:
             self.log(f'TRADE CLOSED, PNL: {trade.pnlcomm:.2f}')
             
+            # CRITICAL FIX: Determine side from the trade object itself, which is robust.
+            side = "LONG" if trade.islong else "SHORT"
+            
             pnl_pct = (trade.pnlcomm / (self.trade_entry_price * abs(trade.size))) if self.trade_entry_price * abs(trade.size) != 0 else 0.0
-            side = "LONG" if trade.history[0].event.size > 0 else "SHORT"
             
             log_trade(
                 symbol=self.d5m._name, side=side, entry_price=self.trade_entry_price,
@@ -68,9 +70,11 @@ class LiveAIStrategy(bt.Strategy):
             trade_summary = f"Outcome: {outcome}, PNL: {trade.pnlcomm:.2f} USDT. Entry Reason: {self.trade_entry_reason}"
             summarize_and_learn_sync(trade_summary, self.d5m._name)
             
+            # Reset all trade-specific state
             self.trade_entry_reason = ""
             self.trade_entry_price = 0
             self.active_sl_tp = {}
+            self.trade_side = ""
 
     def notify_order(self, order):
         if order.status in [order.Canceled, order.Margin, order.Rejected]:
@@ -82,8 +86,7 @@ class LiveAIStrategy(bt.Strategy):
             return
 
         bars_to_process = min(len(self.d5m), 200)
-        if bars_to_process < 60:
-            return
+        if bars_to_process < 60: return
             
         df_5m = pd.DataFrame({
             'date': [bt.num2date(x) for x in self.d5m.datetime.get(ago=-1, size=bars_to_process)],
@@ -97,7 +100,7 @@ class LiveAIStrategy(bt.Strategy):
         
         current_price = self.d5m.close[0]
         analysis_bundle = analyze_freqtrade_data(df_5m, current_price)
-        pos_report = "Side: FLAT" if not self.position else f"Side: {'LONG' if self.position.size > 0 else 'SHORT'}"
+        pos_report = "Side: FLAT" if not self.position else f"Side: {self.trade_side}, Entry: {self.trade_entry_price:.4f}"
         
         self.log("Requesting live AI decision...")
         decision, _, _ = get_ai_decision_sync(
@@ -111,6 +114,7 @@ class LiveAIStrategy(bt.Strategy):
 
         action = decision.get('action')
         
+        # --- LOGIC FOR WHEN NOT IN A POSITION ---
         if not self.position:
             if action == 'OPEN_POSITION' and decision.get('confidence') == 'high':
                 side = decision.get('decision')
@@ -130,9 +134,11 @@ class LiveAIStrategy(bt.Strategy):
                 size = risk_amount / abs(current_price - sl) if (current_price - sl) != 0 else 0
                 if size <= 0: return
                 
+                # Set state for the new trade
                 self.trade_entry_reason = decision.get('reasoning', 'N/A')
                 self.trade_entry_price = current_price
                 self.active_sl_tp = {'sl': sl, 'tp': tp}
+                self.trade_side = side
 
                 if side == 'LONG':
                     self.log(f"AI DECISION: GO LONG, Size: {size:.4f}, Risk: {risk_to_use*100:.2f}%")
@@ -143,7 +149,15 @@ class LiveAIStrategy(bt.Strategy):
             else:
                 self.log(f"AI DECISION: {action}. Reason: {decision.get('reasoning', 'N/A')}")
         
+        # --- LOGIC FOR WHEN IN A POSITION ---
         elif self.position:
+            # CRITICAL FIX: Handle in-trade decisions from the AI
+            if action == 'CLOSE_POSITION':
+                self.log(f"AI DECISION: CLOSE POSITION at {current_price:.2f}. Reason: {decision.get('reasoning')}")
+                self.close() # Close the position
+                return
+
+            # Check for manual SL/TP exit
             sl = self.active_sl_tp.get('sl')
             tp = self.active_sl_tp.get('tp')
 
@@ -162,6 +176,8 @@ class LiveAIStrategy(bt.Strategy):
                 elif sl and current_price >= sl:
                     self.log(f"STOP LOSS (SHORT) HIT at {current_price:.2f}")
                     self.close()
+            else:
+                 self.log(f"AI DECISION (IN TRADE): HOLD. Reason: {decision.get('reasoning', 'N/A')}")
 
 
 if __name__ == '__main__':
@@ -174,13 +190,13 @@ if __name__ == '__main__':
     data_path = 'SOLUSDT-5m-data.csv'
     
     try:
-        # This correctly reads a CSV that HAS a header row.
-        dataframe = pd.read_csv(data_path)
-        
+        dataframe = pd.read_csv(
+            data_path,
+            header=0,
+            names=['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_volume', 'count', 'taker_buy_volume', 'taker_buy_quote_volume', 'ignore']
+        )
         dataframe['datetime'] = pd.to_datetime(dataframe['open_time'], unit='ms')
         dataframe.set_index('datetime', inplace=True)
-        # For a quicker test run, uncomment the next line:
-        # dataframe = dataframe.tail(500) 
     except FileNotFoundError:
         print(f"ERROR: Data file '{data_path}' not found.")
         exit()
