@@ -1,8 +1,9 @@
 # execution_manager.py
 
-import ccxt # Switched from ccxt.pro to synchronous ccxt
+import ccxt
 import time
-from typing import List, Dict, Union, Any
+from typing import List, Dict, Any
+import pandas as pd
 
 # --- Local Imports ---
 import config
@@ -20,7 +21,6 @@ class ExchangeManager:
                 'recvWindow': 10000,
             },
         }
-        # Client creation is now synchronous
         self.client = getattr(ccxt, 'binance')(client_config)
         
         if config.BINANCE_TESTNET:
@@ -37,6 +37,52 @@ class ExchangeManager:
     def close_client(self):
         """No explicit close needed for synchronous CCXT, but we keep the method for cleanup."""
         print("✅ CCXT client connection closed.")
+
+    # ########################################################################### #
+    # ################## START OF MODIFIED SECTION ############################## #
+    # ########################################################################### #
+    def fetch_full_historical_data(self, symbol: str, timeframe: str, days_of_data: int = 60) -> List[List]:
+        """
+        Fetches a large, continuous historical dataset for a symbol using multiple paginated requests.
+        """
+        print(f"💧 Fetching full historical data for {symbol} ({days_of_data} days)...")
+        try:
+            # Calculate the total number of candles needed
+            ms_per_candle = self.client.parse_timeframe(timeframe) * 1000
+            candles_per_day = (24 * 60 * 60 * 1000) / ms_per_candle
+            total_candles_needed = int(candles_per_day * days_of_data)
+            
+            limit_per_call = 1000  # Exchange limit per API call
+            all_klines = []
+            
+            # Start fetching from the current time and go backwards
+            since = self.client.milliseconds() - (total_candles_needed * ms_per_candle)
+
+            while len(all_klines) < total_candles_needed:
+                klines = self.client.fetch_ohlcv(symbol, timeframe, since=since, limit=limit_per_call)
+                if not klines:
+                    break # No more data available
+                
+                all_klines.extend(klines)
+                since = klines[-1][0] + ms_per_candle # Move the 'since' parameter to the end of the last batch
+                
+                print(f"   - Fetched {len(klines)} candles for {symbol}, total: {len(all_klines)}/{total_candles_needed}")
+                time.sleep(self.client.rateLimit / 1000) # Respect rate limits
+
+            # Sort and remove duplicates, just in case
+            df = pd.DataFrame(all_klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df.drop_duplicates(subset=['timestamp'], keep='first', inplace=True)
+            df.sort_values(by='timestamp', inplace=True)
+            
+            print(f"✅ Successfully fetched {len(df)} unique historical candles for {symbol}.")
+            return df.values.tolist()
+
+        except Exception as e:
+            print(f"❌ CRITICAL ERROR fetching full history for {symbol}: {e}")
+            return []
+    # ########################################################################### #
+    # ################### END OF MODIFIED SECTION ############################### #
+    # ########################################################################### #
 
     def get_account_vitals(self) -> Dict[str, float]:
         """Synchronously retrieves global account equity and available margin."""
@@ -65,7 +111,6 @@ class ExchangeManager:
         klines_map = {}
         for symbol in symbols:
             try:
-                # This call is blocking
                 result = self.client.fetch_ohlcv(symbol, timeframe, limit=limit)
                 klines_map[symbol] = result
             except Exception as e:
@@ -96,9 +141,8 @@ class ExchangeManager:
         try:
             formatted_price = self.client.price_to_precision(symbol, price)
             formatted_quantity = self.client.amount_to_precision(symbol, quantity)
-            ccxt_side = side.lower()
+            ccxt_side = 'buy' if side.upper() == 'LONG' else 'sell'
             
-            # This call is blocking
             order = self.client.create_order(
                 symbol=symbol, type='LIMIT', side=ccxt_side,
                 amount=formatted_quantity, price=formatted_price, params={'postOnly': True}
@@ -113,7 +157,7 @@ class ExchangeManager:
         """Synchronously cancels all existing conditional orders and places new ones."""
         try:
             self.client.cancel_all_orders(symbol)
-            time.sleep(0.5) # Blocking sleep
+            time.sleep(0.5)
         except Exception as e:
             print(f"⚠️ Could not cancel orders for {symbol}, proceeding: {e}")
 
@@ -122,20 +166,18 @@ class ExchangeManager:
         
         try:
             if new_tp and new_tp > 0:
-                tp_params = {'stopPrice': self.client.price_to_precision(symbol, new_tp), 'closePosition': True}
                 self.client.create_order(
                     symbol=symbol, type='TAKE_PROFIT_MARKET', side=close_side,
-                    amount=formatted_quantity, params=tp_params
+                    amount=formatted_quantity, stopPrice=self.client.price_to_precision(symbol, new_tp),
+                    params={'closePosition': True}
                 )
             if new_sl and new_sl > 0:
-                sl_params = {'stopPrice': self.client.price_to_precision(symbol, new_sl), 'closePosition': True}
                 self.client.create_order(
                     symbol=symbol, type='STOP_MARKET', side=close_side,
-                    amount=formatted_quantity, params=sl_params
+                    amount=formatted_quantity, stopPrice=self.client.price_to_precision(symbol, new_sl),
+                    params={'closePosition': True}
                 )
-            
             return {'status': 'success'}
-
         except Exception as e:
             try: self.client.cancel_all_orders(symbol) 
             except: pass
