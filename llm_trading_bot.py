@@ -138,11 +138,20 @@ def main():
             "last_ai_response": "No analysis yet.", "last_sentiment_score": 0.0, "last_known_price": 0.0
         }
 
-    add_log("💧 Hydrating historical data for all symbols sequentially...")
-    initial_klines_map = exchange.fetch_historical_klines(config.SYMBOLS_TO_TRADE, config.TIMEFRAME, 500)
-    for symbol, klines in initial_klines_map.items():
-        if klines: HISTORICAL_DATA[symbol] = process_klines(klines)
-        else: add_log(f"⚠️ Could not hydrate data for {symbol}.", "SYSTEM")
+    # ########################################################################### #
+    # ################## START OF MODIFIED SECTION ############################## #
+    # ########################################################################### #
+    add_log("💧 Hydrating full historical data for all symbols sequentially...")
+    for symbol in config.SYMBOLS_TO_TRADE:
+        # CRITICAL FIX: Use the new function to get a large dataset
+        klines = exchange.fetch_full_historical_data(symbol, config.TIMEFRAME, days_of_data=60)
+        if klines:
+            HISTORICAL_DATA[symbol] = process_klines(klines)
+        else:
+            add_log(f"⚠️ Could not hydrate data for {symbol}. It will be skipped.", "SYSTEM")
+    # ########################################################################### #
+    # ################### END OF MODIFIED SECTION ############################### #
+    # ########################################################################### #
     add_log("✅ Data hydration complete.")
     add_log(f"🚀 Bot engine is live. Polling every {config.FAST_CHECK_INTERVAL}s.")
     
@@ -158,7 +167,7 @@ def main():
             latest_klines_map = exchange.fetch_historical_klines(config.SYMBOLS_TO_TRADE, config.TIMEFRAME, limit=2)
             
             for symbol in config.SYMBOLS_TO_TRADE:
-                if symbol not in BOT_STATE: continue
+                if symbol not in BOT_STATE or symbol not in HISTORICAL_DATA: continue
                 
                 symbol_state = BOT_STATE[symbol]
                 pos = open_positions_map.get(symbol, {"side": None})
@@ -167,11 +176,13 @@ def main():
 
                 df_5m_update = process_klines(latest_klines_map.get(symbol, []))
                 if not df_5m_update.empty:
-                    HISTORICAL_DATA[symbol] = df_5m_update.combine_first(HISTORICAL_DATA.get(symbol, pd.DataFrame()))
-                    if len(HISTORICAL_DATA[symbol]) > 500: 
-                        HISTORICAL_DATA[symbol] = HISTORICAL_DATA[symbol].iloc[-500:].copy()
+                    # More robust way to combine and keep the dataframe sorted and sized correctly
+                    combined_df = pd.concat([HISTORICAL_DATA.get(symbol, pd.DataFrame()), df_5m_update])
+                    combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
+                    combined_df.sort_index(inplace=True)
+                    HISTORICAL_DATA[symbol] = combined_df.tail(18000) # Keep a rolling window of ~60 days
 
-                if symbol not in HISTORICAL_DATA or HISTORICAL_DATA[symbol].empty: continue
+                if HISTORICAL_DATA[symbol].empty: continue
                 
                 current_price = exchange.get_current_mark_price(symbol)
                 symbol_state['last_known_price'] = current_price
@@ -236,7 +247,7 @@ def main():
                                 add_log(f"🚨 Max positions reached. Skipping open for {symbol}.", symbol)
                             else:
                                 qty = calculate_position_size(vitals['total_equity'], vitals['available_margin'], decision.get('risk_percent', 0), decision.get('entry_price', 0), decision.get('stop_loss', 0), decision.get('leverage', 0), symbol, exchange)
-                                decision['quantity'] = qty # Store calculated quantity for logging
+                                decision['quantity'] = qty
                                 
                                 if qty > 0:
                                     res = exchange.place_limit_order(symbol, decision['decision'], qty, decision['entry_price'])
@@ -260,7 +271,6 @@ def main():
                             
                         symbol_state['trigger_manager'].set_triggers(decision)
                 
-                # Update the DB state for this symbol at the end of its loop
                 update_bot_state(symbol, is_in_position, pos, {
                     'market_context': symbol_state['market_context'],
                     'active_triggers': symbol_state['trigger_manager'].triggers,
