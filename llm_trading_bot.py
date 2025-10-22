@@ -133,25 +133,20 @@ def main():
         BOT_STATE[symbol] = {
             "trigger_manager": DynamicTriggerManager(symbol), 
             "market_context": load_market_context(symbol), 
-            "last_decision": {}, "trade_state": {"is_trailing_active": False, "current_stop_loss": None}, 
+            "last_decision": {}, 
+            # CRITICAL FIX: 'trade_state' now holds the current SL and trailing parameters
+            "trade_state": {"current_stop_loss": None, "trailing_distance_pct": None}, 
             "was_in_position": False, "current_position": {"side": None},
             "last_ai_response": "No analysis yet.", "last_sentiment_score": 0.0, "last_known_price": 0.0
         }
 
-    # ########################################################################### #
-    # ################## START OF MODIFIED SECTION ############################## #
-    # ########################################################################### #
     add_log("💧 Hydrating full historical data for all symbols sequentially...")
     for symbol in config.SYMBOLS_TO_TRADE:
-        # CRITICAL FIX: Use the new function to get a large dataset
         klines = exchange.fetch_full_historical_data(symbol, config.TIMEFRAME, days_of_data=60)
         if klines:
             HISTORICAL_DATA[symbol] = process_klines(klines)
         else:
             add_log(f"⚠️ Could not hydrate data for {symbol}. It will be skipped.", "SYSTEM")
-    # ########################################################################### #
-    # ################### END OF MODIFIED SECTION ############################### #
-    # ########################################################################### #
     add_log("✅ Data hydration complete.")
     add_log(f"🚀 Bot engine is live. Polling every {config.FAST_CHECK_INTERVAL}s.")
     
@@ -176,11 +171,10 @@ def main():
 
                 df_5m_update = process_klines(latest_klines_map.get(symbol, []))
                 if not df_5m_update.empty:
-                    # More robust way to combine and keep the dataframe sorted and sized correctly
                     combined_df = pd.concat([HISTORICAL_DATA.get(symbol, pd.DataFrame()), df_5m_update])
                     combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
                     combined_df.sort_index(inplace=True)
-                    HISTORICAL_DATA[symbol] = combined_df.tail(18000) # Keep a rolling window of ~60 days
+                    HISTORICAL_DATA[symbol] = combined_df.tail(18000)
 
                 if HISTORICAL_DATA[symbol].empty: continue
                 
@@ -192,7 +186,7 @@ def main():
                     trades = exchange.fetch_account_trade_list(symbol, limit=5)
                     
                     if trades:
-                        pnl = float(trades[0].get('info', {}).get('realizedPnl', 0)) if trades[0].get('info', {}).get('realizedPnl') else 0.0
+                        pnl = float(trades.get('info', {}).get('realizedPnl', 0)) if trades.get('info', {}).get('realizedPnl') else 0.0
                         entry_reason = symbol_state['last_decision'].get('reasoning', 'N/A')
                         entry_price = symbol_state['last_decision'].get('entry_price', 0)
                         quantity = symbol_state['last_decision'].get('quantity', 0)
@@ -204,18 +198,38 @@ def main():
                         trade_summary = f"Outcome: {'WIN' if pnl > 0 else 'LOSS'}, PNL: {pnl:.2f} USDT. Entry Reason: {entry_reason}"
                         summarize_and_learn_sync(trade_summary, symbol)
                         
-                    symbol_state["trade_state"] = {"is_trailing_active": False, "current_stop_loss": None}
+                    # Reset trade state on close
+                    symbol_state["trade_state"] = {"current_stop_loss": None, "trailing_distance_pct": None}
                 symbol_state['was_in_position'] = is_in_position
                 
-                if is_in_position and symbol_state['last_decision'].get('action') == 'OPEN_POSITION':
-                    activation_price = symbol_state['last_decision'].get('trailing_activation_price')
-                    if activation_price and not symbol_state['trade_state']['is_trailing_active']:
-                        if (pos['side'] == 'LONG' and current_price >= activation_price) or (pos['side'] == 'SHORT' and current_price <= activation_price):
-                            add_log(f"🔒 Breakeven Trigger for {symbol}. Moving SL to entry: {pos['entry_price']}.", symbol)
-                            res = exchange.modify_protective_orders(symbol, pos['side'], pos['quantity'], new_sl=pos['entry_price'])
-                            if res['status'] == 'success':
-                                symbol_state['trade_state']['is_trailing_active'] = True
-                                symbol_state['trade_state']['current_stop_loss'] = pos['entry_price']
+                # ########################################################################### #
+                # ################## START OF MODIFIED SECTION ############################## #
+                # ########################################################################### #
+                # --- CLIENT-SIDE TRAILING STOP LOGIC ---
+                if is_in_position:
+                    current_sl = symbol_state['trade_state'].get('current_stop_loss')
+                    trail_pct = symbol_state['trade_state'].get('trailing_distance_pct')
+
+                    if current_sl and trail_pct:
+                        potential_new_sl = 0.0
+                        if pos['side'] == 'LONG':
+                            potential_new_sl = current_price * (1 - (trail_pct / 100.0))
+                            # We only move the stop up, never down
+                            if potential_new_sl > current_sl:
+                                add_log(f"📈 Trailing SL (LONG) for {symbol}. New SL: {potential_new_sl:.4f}", symbol)
+                                exchange.modify_protective_orders(symbol, pos['side'], pos['quantity'], new_sl=potential_new_sl)
+                                symbol_state['trade_state']['current_stop_loss'] = potential_new_sl
+                        
+                        elif pos['side'] == 'SHORT':
+                            potential_new_sl = current_price * (1 + (trail_pct / 100.0))
+                            # We only move the stop down, never up
+                            if potential_new_sl < current_sl:
+                                add_log(f"📈 Trailing SL (SHORT) for {symbol}. New SL: {potential_new_sl:.4f}", symbol)
+                                exchange.modify_protective_orders(symbol, pos['side'], pos['quantity'], new_sl=potential_new_sl)
+                                symbol_state['trade_state']['current_stop_loss'] = potential_new_sl
+                # ########################################################################### #
+                # ################### END OF MODIFIED SECTION ############################### #
+                # ########################################################################### #
 
                 is_triggered, reason = symbol_state['trigger_manager'].check_triggers(HISTORICAL_DATA[symbol])
 
@@ -224,7 +238,7 @@ def main():
                     
                     analysis_bundle = analyze_freqtrade_data(HISTORICAL_DATA[symbol], current_price)
                     
-                    news_text = get_news_from_rss(symbol.split('/')[0])
+                    news_text = get_news_from_rss(symbol.split('/'))
                     sentiment_score = get_sentiment_score_sync(news_text)
                     symbol_state['last_sentiment_score'] = sentiment_score
                     
@@ -255,7 +269,9 @@ def main():
                                         add_log(f"✅ Entry order placed for {symbol}. Setting SL/TP.", symbol)
                                         time.sleep(2) 
                                         exchange.modify_protective_orders(symbol, decision['decision'], qty, decision.get('stop_loss'), decision.get('take_profit'))
+                                        # Store initial SL and trailing distance in the state
                                         symbol_state['trade_state']['current_stop_loss'] = decision.get('stop_loss')
+                                        symbol_state['trade_state']['trailing_distance_pct'] = decision.get('trailing_distance_pct')
                                     else:
                                         add_log(f"❌ Failed to place entry order: {res['message']}", symbol)
                                 else:
