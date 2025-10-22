@@ -43,24 +43,40 @@ def load_market_context(symbol: str) -> Dict:
         log_system_message(f"No previous market context file found for {symbol}. Starting fresh.", symbol)
         return {}
 
-def calculate_position_size(equity, available_margin, risk_percent, entry_price, stop_loss_price, leverage, symbol, exchange_manager: ExchangeManager):
-    if any(p is None or p <= 0 for p in [equity, available_margin, risk_percent, entry_price, stop_loss_price, leverage]): return 0.0
-    try:
-        amount_to_risk = equity * min(risk_percent / 100, config.MAX_RISK_PER_TRADE)
-        price_delta = abs(entry_price - stop_loss_price)
-        risk_based_size = amount_to_risk / price_delta if price_delta > 0 else 0
-        max_position_value = available_margin * leverage * 0.95
-        margin_based_size = max_position_value / entry_price
-        final_size = min(risk_based_size, margin_based_size)
-        if final_size < risk_based_size and risk_based_size > 0:
-            add_log(f"⚠️ Risk-based size ({risk_based_size:.4f}) unaffordable. Capped by margin to {final_size:.4f}.", symbol)
-        return float(exchange_manager.client.amount_to_precision(symbol, final_size))
-    except Exception as e:
-        add_log(f"❌ Error in calculate_position_size for {symbol}: {e}", symbol)
+# ########################################################################### #
+# ################## START OF MODIFIED SECTION ############################## #
+# ########################################################################### #
+def calculate_aggressive_position_size(available_margin, commitment_pct, entry_price, leverage, symbol, exchange_manager: ExchangeManager):
+    """
+    Calculates position size based on a percentage of total available buying power.
+    This is the "ALL-IN" / "梭哈" logic.
+    """
+    if any(p is None or p <= 0 for p in [available_margin, commitment_pct, entry_price, leverage]):
         return 0.0
+    try:
+        # Calculate the maximum value of a position you can open
+        max_position_value = available_margin * leverage
+        
+        # Use the percentage commitment dictated by the AI
+        target_position_value = max_position_value * (commitment_pct / 100.0)
+        
+        # Add a small safety buffer to avoid margin errors
+        final_position_value = target_position_value * 0.98 
+        
+        size = final_position_value / entry_price if entry_price > 0 else 0
+        
+        add_log(f"AGGRESSIVE SIZING: Committing {commitment_pct}% of buying power. Target Size: {size:.4f}", symbol)
+        return float(exchange_manager.client.amount_to_precision(symbol, size))
+    except Exception as e:
+        add_log(f"❌ Error in calculate_aggressive_position_size for {symbol}: {e}", symbol)
+        return 0.0
+# ########################################################################### #
+# ################### END OF MODIFIED SECTION ############################### #
+# ########################################################################### #
 
 # --- DynamicTriggerManager ---
 class DynamicTriggerManager:
+    # ... (This class remains unchanged) ...
     def __init__(self, symbol: str):
         self.triggers: List[Dict] = []
         self.timeout = None
@@ -134,8 +150,7 @@ def main():
             "trigger_manager": DynamicTriggerManager(symbol), 
             "market_context": load_market_context(symbol), 
             "last_decision": {}, 
-            # CRITICAL FIX: 'trade_state' now holds the current SL and trailing parameters
-            "trade_state": {"current_stop_loss": None, "trailing_distance_pct": None}, 
+            "trade_state": {"current_stop_loss": None}, 
             "was_in_position": False, "current_position": {"side": None},
             "last_ai_response": "No analysis yet.", "last_sentiment_score": 0.0, "last_known_price": 0.0
         }
@@ -164,6 +179,7 @@ def main():
             for symbol in config.SYMBOLS_TO_TRADE:
                 if symbol not in BOT_STATE or symbol not in HISTORICAL_DATA: continue
                 
+                # ... (The rest of the loop for data updates, PNL logging, etc., remains largely the same) ...
                 symbol_state = BOT_STATE[symbol]
                 pos = open_positions_map.get(symbol, {"side": None})
                 is_in_position = pos.get('side') is not None
@@ -186,50 +202,22 @@ def main():
                     trades = exchange.fetch_account_trade_list(symbol, limit=5)
                     
                     if trades:
-                        pnl = float(trades.get('info', {}).get('realizedPnl', 0)) if trades.get('info', {}).get('realizedPnl') else 0.0
+                        last_trade = trades
+                        pnl = float(last_trade.get('info', {}).get('realizedPnl', 0))
                         entry_reason = symbol_state['last_decision'].get('reasoning', 'N/A')
-                        entry_price = symbol_state['last_decision'].get('entry_price', 0)
-                        quantity = symbol_state['last_decision'].get('quantity', 0)
+                        entry_price = symbol_state['current_position'].get('entry_price', 0)
+                        quantity = symbol_state['current_position'].get('quantity', 0)
                         exit_price = current_price 
-                        pnl_pct = (pnl / (entry_price * quantity)) if entry_price * quantity != 0 else 0.0
-                        
+                        pnl_pct = (pnl / (entry_price * quantity)) if entry_price and quantity else 0.0
                         log_trade(symbol, symbol_state['current_position'].get('side', 'UNKNOWN'), entry_price, exit_price, quantity, pnl, pnl_pct, entry_reason)
-                        
                         trade_summary = f"Outcome: {'WIN' if pnl > 0 else 'LOSS'}, PNL: {pnl:.2f} USDT. Entry Reason: {entry_reason}"
                         summarize_and_learn_sync(trade_summary, symbol)
                         
-                    # Reset trade state on close
-                    symbol_state["trade_state"] = {"current_stop_loss": None, "trailing_distance_pct": None}
+                    symbol_state["trade_state"] = {"current_stop_loss": None}
                 symbol_state['was_in_position'] = is_in_position
                 
-                # ########################################################################### #
-                # ################## START OF MODIFIED SECTION ############################## #
-                # ########################################################################### #
-                # --- CLIENT-SIDE TRAILING STOP LOGIC ---
-                if is_in_position:
-                    current_sl = symbol_state['trade_state'].get('current_stop_loss')
-                    trail_pct = symbol_state['trade_state'].get('trailing_distance_pct')
-
-                    if current_sl and trail_pct:
-                        potential_new_sl = 0.0
-                        if pos['side'] == 'LONG':
-                            potential_new_sl = current_price * (1 - (trail_pct / 100.0))
-                            # We only move the stop up, never down
-                            if potential_new_sl > current_sl:
-                                add_log(f"📈 Trailing SL (LONG) for {symbol}. New SL: {potential_new_sl:.4f}", symbol)
-                                exchange.modify_protective_orders(symbol, pos['side'], pos['quantity'], new_sl=potential_new_sl)
-                                symbol_state['trade_state']['current_stop_loss'] = potential_new_sl
-                        
-                        elif pos['side'] == 'SHORT':
-                            potential_new_sl = current_price * (1 + (trail_pct / 100.0))
-                            # We only move the stop down, never up
-                            if potential_new_sl < current_sl:
-                                add_log(f"📈 Trailing SL (SHORT) for {symbol}. New SL: {potential_new_sl:.4f}", symbol)
-                                exchange.modify_protective_orders(symbol, pos['side'], pos['quantity'], new_sl=potential_new_sl)
-                                symbol_state['trade_state']['current_stop_loss'] = potential_new_sl
-                # ########################################################################### #
-                # ################### END OF MODIFIED SECTION ############################### #
-                # ########################################################################### #
+                # The trailing stop logic is removed as it's a risk management feature.
+                # You can add it back if you want, but it contradicts the "all-in" philosophy.
 
                 is_triggered, reason = symbol_state['trigger_manager'].check_triggers(HISTORICAL_DATA[symbol])
 
@@ -257,25 +245,39 @@ def main():
                         action = decision['action']
                         
                         if action == 'OPEN_POSITION' and not is_in_position:
-                            if len(open_positions_map) >= config.MAX_CONCURRENT_POSITIONS:
-                                add_log(f"🚨 Max positions reached. Skipping open for {symbol}.", symbol)
-                            else:
-                                qty = calculate_position_size(vitals['total_equity'], vitals['available_margin'], decision.get('risk_percent', 0), decision.get('entry_price', 0), decision.get('stop_loss', 0), decision.get('leverage', 0), symbol, exchange)
-                                decision['quantity'] = qty
-                                
-                                if qty > 0:
-                                    res = exchange.place_limit_order(symbol, decision['decision'], qty, decision['entry_price'])
-                                    if res['status'] == 'success':
-                                        add_log(f"✅ Entry order placed for {symbol}. Setting SL/TP.", symbol)
-                                        time.sleep(2) 
-                                        exchange.modify_protective_orders(symbol, decision['decision'], qty, decision.get('stop_loss'), decision.get('take_profit'))
-                                        # Store initial SL and trailing distance in the state
-                                        symbol_state['trade_state']['current_stop_loss'] = decision.get('stop_loss')
-                                        symbol_state['trade_state']['trailing_distance_pct'] = decision.get('trailing_distance_pct')
-                                    else:
-                                        add_log(f"❌ Failed to place entry order: {res['message']}", symbol)
+                            # ########################################################################### #
+                            # ################## START OF MODIFIED SECTION ############################## #
+                            # ########################################################################### #
+                            # REMOVED: The check for MAX_CONCURRENT_POSITIONS is gone.
+                            # if len(open_positions_map) >= config.MAX_CONCURRENT_POSITIONS:
+                            #    add_log(f"🚨 Max positions reached. Skipping open for {symbol}.", symbol)
+                            # else:
+                            
+                            # Use the new aggressive sizing function
+                            qty = calculate_aggressive_position_size(
+                                vitals['available_margin'], 
+                                decision.get('portfolio_commitment_pct', 0), 
+                                decision.get('entry_price', 0), 
+                                decision.get('leverage', 0), 
+                                symbol, 
+                                exchange
+                            )
+                            decision['quantity'] = qty
+                            
+                            if qty > 0:
+                                res = exchange.place_limit_order(symbol, decision['decision'], qty, decision['entry_price'])
+                                if res['status'] == 'success':
+                                    add_log(f"✅ Entry order placed for {symbol}. Setting SL/TP.", symbol)
+                                    time.sleep(2) 
+                                    exchange.modify_protective_orders(symbol, decision['decision'], qty, decision.get('stop_loss'), decision.get('take_profit'))
+                                    symbol_state['trade_state']['current_stop_loss'] = decision.get('stop_loss')
                                 else:
-                                    add_log(f"⚠️ Calculated position size is zero. Skipping trade.", symbol)
+                                    add_log(f"❌ Failed to place entry order: {res['message']}", symbol)
+                            else:
+                                add_log(f"⚠️ Calculated position size is zero. Skipping trade.", symbol)
+                            # ########################################################################### #
+                            # ################### END OF MODIFIED SECTION ############################### #
+                            # ########################################################################### #
                                     
                         elif action == 'CLOSE_POSITION' and is_in_position:
                             exchange.close_position_market(symbol, pos)
