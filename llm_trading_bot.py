@@ -200,6 +200,11 @@ def main():
 
                 if symbol_state['was_in_position'] and not is_in_position:
                     add_log(f"📉 Position closed for {symbol}. Triggering learning cycle.", symbol)
+                    try:
+                        exchange.client.cancel_all_orders(symbol)
+                        add_log(f"✅ Canceled all open orders for {symbol} post-closure.", symbol)
+                    except Exception as e:
+                        add_log(f"⚠️ Could not cancel open orders for {symbol}: {e}", symbol)
                     trades = exchange.fetch_account_trade_list(symbol, limit=5)
                     
                     if trades:
