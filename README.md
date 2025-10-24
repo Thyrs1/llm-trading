@@ -18,8 +18,12 @@ A few python scripts to automatically trade in cryptocurrencies markets w/ the h
 Featuring Backtesting, State-less Full AI Decisions, a clean monitoring Dashboard, and more.
 
 ### Installation
+
+Recommended use WSL
+
  - `git clone https://github.com/Thyrs1/llm-trading`
- - `pip -q requirements.txt`
+ - `uv venv`
+ - `uv pip install -r requirements.txt`
 
 ### Usage of Backtest Bot
  - `mv config.template.py config.py`
