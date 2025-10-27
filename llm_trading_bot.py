@@ -328,7 +328,7 @@ def main():
                     
                     analysis_bundle = analyze_freqtrade_data(HISTORICAL_DATA[symbol], current_price)
                     
-                    news_text = get_news_from_rss(symbol.split('/'))
+                    news_text = get_news_from_rss(symbol.split('/')[0])
                     sentiment_score = get_sentiment_score_sync(news_text)
                     symbol_state['last_sentiment_score'] = sentiment_score
                     
