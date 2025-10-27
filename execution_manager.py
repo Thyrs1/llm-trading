@@ -109,7 +109,19 @@ class ExchangeManager:
         except Exception as e:
             print(f"⚠️ Could not fetch orderbook ticker for {symbol}: {e}", symbol)
             return {}
-
+        
+    def set_leverage_for_symbol(self, symbol: str, leverage: int):
+        """Sets the leverage for a specific symbol."""
+        try:
+            # CCXT requires the symbol without the :USDT suffix for setting leverage
+            market_id = self.client.market(symbol)['id']
+            self.client.set_leverage(leverage, market_id)
+            # Use print here as this module doesn't have access to the bot's logger
+            print(f"✅ Leverage for {symbol} set to {leverage}x.")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to set leverage for {symbol}: {e}")
+            return False
     def get_current_mark_price(self, symbol: str) -> float:
         """Fetches the current mark price for a specific symbol."""
         try:

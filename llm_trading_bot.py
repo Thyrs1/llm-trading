@@ -222,7 +222,7 @@ def main():
             "market_context_history": deque(maxlen=12), 
             # ################### END OF MODIFIED SECTION ###############################
             "last_decision": {}, 
-            "trade_state": {"current_stop_loss": None, "trailing_distance_pct": None}, 
+            "trade_state": {"current_stop_loss": None, "trailing_distance_pct": None, "pending_order_id": None}, 
             "was_in_position": False, "current_position": {"side": None},
             "last_ai_response": "No analysis yet.", "chain_of_thought": "No thought process recorded yet.",
             "last_sentiment_score": 0.0, "last_known_price": 0.0
@@ -294,32 +294,22 @@ def main():
                     symbol_state["trade_state"] = {"current_stop_loss": None, "trailing_distance_pct": None}
                 symbol_state['was_in_position'] = is_in_position
                 
-                # ########################################################################### #
-                # ################## START OF MODIFIED SECTION ############################## #
-                # ########################################################################### #
-                # CORE CHANGE: Re-instated the client-side trailing stop logic.
-                if is_in_position:
-                    current_sl = symbol_state['trade_state'].get('current_stop_loss')
-                    trail_pct = symbol_state['trade_state'].get('trailing_distance_pct')
+                if is_in_position and symbol_state['trade_state'].get('pending_order_id'):
+                    add_log(f"✅ Limit order {symbol_state['trade_state']['pending_order_id']} filled. Position is now active.", symbol)
+                    
+                    # Safely set SL/TP because we are now in a confirmed position
+                    decision = symbol_state['last_decision']
+                    qty = pos.get('quantity', decision.get('quantity', 0)) # Use actual position quantity
+                    
+                    add_log(f"Setting SL/TP for active position. SL: {decision.get('stop_loss')}, TP: {decision.get('take_profit')}", symbol)
+                    exchange.modify_protective_orders(symbol, decision['decision'], qty, decision.get('stop_loss'), decision.get('take_profit'))
+                    
+                    symbol_state['trade_state']['current_stop_loss'] = decision.get('stop_loss')
+                    symbol_state['trade_state']['trailing_distance_pct'] = decision.get('trailing_distance_pct')
+                    symbol_state['trade_state']['pending_order_id'] = None # Clear the pending state
 
-                    if current_sl and trail_pct:
-                        potential_new_sl = 0.0
-                        if pos['side'] == 'LONG':
-                            potential_new_sl = current_price * (1 - (trail_pct / 100.0))
-                            if potential_new_sl > current_sl:
-                                add_log(f"📈 Trailing SL (LONG) for {symbol}. New SL: {potential_new_sl:.4f}", symbol)
-                                exchange.modify_protective_orders(symbol, pos['side'], pos['quantity'], new_sl=potential_new_sl)
-                                symbol_state['trade_state']['current_stop_loss'] = potential_new_sl
-                        
-                        elif pos['side'] == 'SHORT':
-                            potential_new_sl = current_price * (1 + (trail_pct / 100.0))
-                            if potential_new_sl < current_sl:
-                                add_log(f"📈 Trailing SL (SHORT) for {symbol}. New SL: {potential_new_sl:.4f}", symbol)
-                                exchange.modify_protective_orders(symbol, pos['side'], pos['quantity'], new_sl=potential_new_sl)
-                                symbol_state['trade_state']['current_stop_loss'] = potential_new_sl
-                # ########################################################################### #
-                # ################### END OF MODIFIED SECTION ############################### #
-                # ########################################################################### #
+                # Update position info after potential SL/TP placement
+                symbol_state['current_position'] = pos
 
                 is_triggered, reason = symbol_state['trigger_manager'].check_triggers(HISTORICAL_DATA[symbol])
 
@@ -384,43 +374,89 @@ def main():
                                 )
                                 decision['quantity'] = qty
                                 
-                            if qty > 0:
-                                # ########################################################################### #
-                                # ################## START OF MODIFIED SECTION ############################## #
-                                # ########################################################################### #
-                                # --- Standard Limit Order Execution Logic ---
-                                ai_entry_price = decision.get('entry_price', 0)
-                                
-                                if ai_entry_price > 0:
-                                    add_log(f"Placing standard Limit order at AI's specified price: {ai_entry_price}", symbol)
-                                    res = exchange.place_limit_order(symbol, decision['decision'], qty, ai_entry_price)
+                    if decision and decision.get('action'):
+                        symbol_state['last_decision'] = decision
+                        action = decision['action']
+                        
+                        # STATE 2: AI wants to open a position, and we are flat with no pending orders.
+                        if action == 'OPEN_POSITION' and not is_in_position and not symbol_state['trade_state'].get('pending_order_id'):
+                            
+                            # --- Pre-flight Check 1: Max Concurrent Positions ---
+                            if len(open_positions_map) >= config.MAX_CONCURRENT_POSITIONS:
+                                add_log(f"🚨 Max positions reached ({config.MAX_CONCURRENT_POSITIONS}). Skipping open for {symbol}.", symbol)
+                                continue # Skip to the next symbol in the main loop
 
-                                    if res['status'] == 'success':
-                                        add_log(f"✅ Limit order placed successfully for {symbol}. Setting SL/TP.", symbol)
-                                        # A short delay is still good practice before setting SL/TP
-                                        time.sleep(2) 
-                                        exchange.modify_protective_orders(symbol, decision['decision'], qty, decision.get('stop_loss'), decision.get('take_profit'))
-                                        symbol_state['trade_state']['current_stop_loss'] = decision.get('stop_loss')
-                                        symbol_state['trade_state']['trailing_distance_pct'] = decision.get('trailing_distance_pct')
-                                    else:
-                                        add_log(f"❌ Failed to place limit order: {res['message']}", symbol)
+                            # --- Pre-flight Check 2: Calculate Position Size ---
+                            qty = calculate_position_size(
+                                vitals['total_equity'], 
+                                vitals['available_margin'], 
+                                decision.get('risk_percent', 0), 
+                                decision.get('entry_price', 0), 
+                                decision.get('stop_loss', 0), 
+                                decision.get('leverage', 0), 
+                                symbol, 
+                                exchange
+                            )
+                            decision['quantity'] = qty
+                            
+                            if qty > 0:
+                                # --- Pre-flight Check 3: Minimum Notional Value ---
+                                ai_entry_price = decision.get('entry_price', 0)
+                                calculated_notional = qty * ai_entry_price
+                                
+                                min_notional = 0
+                                try:
+                                    min_notional = exchange.client.markets[symbol]['limits']['cost']['min']
+                                except (KeyError, TypeError):
+                                    add_log(f"⚠️ Could not find minimum notional value for {symbol} in market data. Using fallback.", symbol)
+                                    min_notional = 5 # Binance's typical minimum is 5 USDT for most pairs
+
+                                if calculated_notional < min_notional:
+                                    add_log(f"⚠️ Order size is too small. Calculated Notional: ${calculated_notional:.2f}, Minimum Required: ${min_notional:.2f}. Skipping trade.", symbol)
+                                
                                 else:
-                                    add_log(f"⚠️ AI provided an invalid entry price of zero. Skipping trade.", symbol)
-                                # ########################################################################### #
-                                # ################### END OF MODIFIED SECTION ############################### #
-                                # ########################################################################### #
+                                    # --- Execution Step 1: Set Leverage ---
+                                    exchange.set_leverage_for_symbol(symbol, decision.get('leverage', 20))
+                                    time.sleep(1) # Small delay after setting leverage is good practice
+
+                                    # --- Execution Step 2: Place the Limit Order ---
+                                    if ai_entry_price > 0:
+                                        add_log(f"Placing standard Limit order at AI's specified price: {ai_entry_price}", symbol)
+                                        res = exchange.place_limit_order(symbol, decision['decision'], qty, ai_entry_price)
+
+                                        if res['status'] == 'success' and res.get('order'):
+                                            order_id = res['order']['id']
+                                            add_log(f"✅ Limit order placed successfully. Order ID: {order_id}. Waiting for fill.", symbol)
+                                            # --- Execution Step 3: Set the pending state. DO NOT set SL/TP yet. ---
+                                            symbol_state['trade_state']['pending_order_id'] = order_id
+                                        else:
+                                            add_log(f"❌ Failed to place limit order: {res.get('message', 'Unknown error')}", symbol)
+                                    else:
+                                        add_log(f"⚠️ AI provided an invalid entry price of zero. Skipping trade.", symbol)
                             else:
                                 add_log(f"⚠️ Calculated position size is zero. Skipping trade.", symbol)
-                                    
-                        elif action == 'CLOSE_POSITION' and is_in_position:
-                            exchange.close_position_market(symbol, pos)
-                            
+                        
+                        elif action == 'CLOSE_POSITION':
+                            # If we are in a position, close it.
+                            if is_in_position:
+                                add_log(f"AI decision to CLOSE. Closing active position for {symbol}.", symbol)
+                                exchange.close_position_market(symbol, pos)
+                            # If we have a pending order, cancel it.
+                            elif symbol_state['trade_state'].get('pending_order_id'):
+                                add_log(f"AI decision to CLOSE. Cancelling pending order {symbol_state['trade_state']['pending_order_id']} for {symbol}.", symbol)
+                                exchange.cancel_order(symbol_state['trade_state']['pending_order_id'], symbol)
+                                symbol_state['trade_state']['pending_order_id'] = None
+
                         elif action == 'MODIFY_POSITION' and is_in_position:
+                            add_log(f"AI decision to MODIFY. Updating SL/TP for {symbol}.", symbol)
                             res = exchange.modify_protective_orders(symbol, pos['side'], pos['quantity'], decision.get('new_stop_loss'), decision.get('new_take_profit'))
                             if res['status'] == 'success' and decision.get('new_stop_loss'):
                                 symbol_state['trade_state']['current_stop_loss'] = decision.get('new_stop_loss')
-                            
-                        symbol_state['trigger_manager'].set_triggers(decision)
+                                
+                        elif action == 'WAIT':
+                            # This also handles the "HOLD" case when in a position
+                            add_log(f"AI decision: WAIT/HOLD. Reason: {decision.get('reasoning', 'N/A')}", symbol)
+                            symbol_state['trigger_manager'].set_triggers(decision)
                 
                 update_bot_state(symbol, is_in_position, pos, {
                     # Pass the list representation of the deque for JSON serialization
