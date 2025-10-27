@@ -225,22 +225,22 @@ class ExchangeManager:
     # ########################################################################### #
     def fetch_positions(self, symbols: List[str]) -> List[Dict]:
         """
-        Fetches current position details for a list of symbols, ensuring correct
-        and reliable retrieval by passing the symbols list to the underlying CCXT call.
+        Fetches ALL open positions and then filters them locally.
+        This is the most robust method against exchange API race conditions.
         """
-        if not symbols:
-            return []
         try:
-            # CRITICAL FIX: Pass the 'symbols' list directly to the ccxt call.
-            # This is the most robust way to ensure we get immediate and accurate
-            # position data for the symbols we care about.
-            positions = self.client.fetch_positions(symbols=symbols)
+            # CRITICAL FIX: Call fetch_positions() WITHOUT arguments to get ALL positions.
+            # This is the most reliable endpoint and less prone to update delays.
+            all_positions = self.client.fetch_positions()
             
             active_positions = []
-            for pos in positions:
-                if pos.get('contracts') is not None and float(pos['contracts']) != 0:
+            target_symbols = set(symbols)
+            
+            for pos in all_positions:
+                unified_symbol = pos.get('symbol')
+                if unified_symbol in target_symbols and pos.get('contracts') is not None and float(pos['contracts']) != 0:
                     active_positions.append({
-                        "symbol": pos['symbol'], 
+                        "symbol": unified_symbol, 
                         "side": pos['side'].upper(),
                         "quantity": float(pos['contracts']), 
                         "entry_price": float(pos['entryPrice']),
