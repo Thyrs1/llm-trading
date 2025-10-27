@@ -384,39 +384,54 @@ def main():
                                 )
                                 decision['quantity'] = qty
                                 
-                                if qty > 0:
-                                    ai_entry_price = decision.get('entry_price', 0)
-                                    adjusted_entry_price = 0
+                            if qty > 0:
+                                # --- Hybrid Order Execution Logic ---
+                                MAKER_ORDER_WAIT_TIME_S = 5 # Wait 5 seconds for the maker order
+                                
+                                # 1. Try to place a passive Maker order
+                                ai_entry_price = decision.get('entry_price', 0)
+                                adjusted_entry_price = 0
+                                if decision.get('decision') == 'LONG':
+                                    adjusted_entry_price = ai_entry_price * 0.9995
+                                elif decision.get('decision') == 'SHORT':
+                                    adjusted_entry_price = ai_entry_price * 1.0005
+                                
+                                add_log(f"Attempting Maker order at {adjusted_entry_price:.4f}. Will wait for {MAKER_ORDER_WAIT_TIME_S}s.", symbol)
+                                maker_res = exchange.place_limit_order(symbol, decision['decision'], qty, adjusted_entry_price)
+
+                                order_filled = False
+                                if maker_res['status'] == 'success':
+                                    maker_order_id = maker_res['order']['id']
+                                    time.sleep(MAKER_ORDER_WAIT_TIME_S)
                                     
-                                    # For a LONG (buy) order, we place it slightly BELOW the AI's price
-                                    # to ensure it rests on the bid side of the order book.
-                                    if decision.get('decision') == 'LONG':
-                                        adjusted_entry_price = ai_entry_price * 0.9995 # 0.05% below
-                                    
-                                    # For a SHORT (sell) order, we place it slightly ABOVE the AI's price
-                                    # to ensure it rests on the ask side of the order book.
-                                    elif decision.get('decision') == 'SHORT':
-                                        adjusted_entry_price = ai_entry_price * 1.0005 # 0.05% above
-                                    
-                                    if adjusted_entry_price > 0:
-                                        add_log(f"Adjusting entry price for Maker order. AI Price: {ai_entry_price}, Adjusted Price: {adjusted_entry_price}", symbol)
-                                        res = exchange.place_limit_order(symbol, decision['decision'], qty, adjusted_entry_price)
+                                    # 2. Check if the Maker order was filled
+                                    order_status = exchange.fetch_order_status(maker_order_id, symbol)
+                                    if order_status and order_status['status'] == 'closed':
+                                        add_log(f"✅ Maker order filled successfully!", symbol)
+                                        order_filled = True
                                     else:
-                                        res = {'status': 'error', 'message': 'Invalid decision side for price adjustment.'}
-                                    if res['status'] == 'success':
-                                        add_log(f"✅ Entry order placed for {symbol}. Setting SL/TP.", symbol)
-                                        time.sleep(2) 
-                                        exchange.modify_protective_orders(symbol, decision['decision'], qty, decision.get('stop_loss'), decision.get('take_profit'))
-                                        # CORE CHANGE: Store initial SL and trailing distance in the state
-                                        symbol_state['trade_state']['current_stop_loss'] = decision.get('stop_loss')
-                                        symbol_state['trade_state']['trailing_distance_pct'] = decision.get('trailing_distance_pct')
-                                    else:
-                                        add_log(f"❌ Failed to place entry order: {res['message']}", symbol)
+                                        add_log(f"⚠️ Maker order not filled. Cancelling and switching to Taker (Market) order.", symbol)
+                                        # 3. If not filled, cancel it
+                                        exchange.cancel_order(maker_order_id, symbol)
+                                        time.sleep(1) # Give exchange time to process cancellation
+                                        
+                                        # 4. Place a Taker (Market) order to ensure entry
+                                        taker_res = exchange.place_market_order(symbol, decision['decision'], qty)
+                                        if taker_res['status'] == 'success':
+                                            add_log(f"✅ Taker (Market) order placed successfully to ensure entry.", symbol)
+                                            order_filled = True
+                                        else:
+                                            add_log(f"❌ CRITICAL: Failed to place Taker order after Maker failed: {taker_res['message']}", symbol)
                                 else:
-                                    add_log(f"⚠️ Calculated position size is zero. Skipping trade.", symbol)
-                            # ########################################################################### #
-                            # ################### END OF MODIFIED SECTION ############################### #
-                            # ########################################################################### #
+                                    add_log(f"❌ Failed to place initial Maker order: {maker_res['message']}", symbol)
+
+                                # 5. If any order was filled, set protective orders
+                                if order_filled:
+                                    exchange.modify_protective_orders(symbol, decision['decision'], qty, decision.get('stop_loss'), decision.get('take_profit'))
+                                    symbol_state['trade_state']['current_stop_loss'] = decision.get('stop_loss')
+                                    symbol_state['trade_state']['trailing_distance_pct'] = decision.get('trailing_distance_pct')
+                            else:
+                                add_log(f"⚠️ Calculated position size is zero. Skipping trade.", symbol)
                                     
                         elif action == 'CLOSE_POSITION' and is_in_position:
                             exchange.close_position_market(symbol, pos)
