@@ -63,10 +63,11 @@ def setup_database():
             unrealized_pnl REAL,
             last_analysis_time TEXT,
             market_context TEXT,
-            active_triggers TEXT,        -- NEW
-            last_ai_response TEXT,       -- NEW
-            last_sentiment_score REAL,   -- NEW
-            last_known_price REAL        -- NEW
+            active_triggers TEXT,
+            last_ai_response TEXT,
+            last_sentiment_score REAL,
+            last_known_price REAL,
+            chain_of_thought TEXT
         )
     """)
 

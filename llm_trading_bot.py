@@ -111,18 +111,86 @@ class DynamicTriggerManager:
                 add_log(f"⚠️ Error checking trigger '{trigger.get('label')}': {e}", self.symbol)
         return False, ""
     def _is_condition_met(self, trigger: Dict, df_5m: pd.DataFrame) -> bool:
+        """Checks if a specific trigger condition is met based on the latest data."""
         trigger_type = trigger.get('type')
-        level = trigger.get('level')
-        direction = trigger.get('direction')
-        if df_5m.empty or level is None or direction is None: return False
-        if trigger_type == 'PRICE_CROSS':
-            latest_candle = df_5m.iloc[-1]
-            if direction == 'ABOVE' and latest_candle['high'] >= level: return True
-            if direction == 'BELOW' and latest_candle['low'] <= level: return True
-        elif trigger_type == 'RSI_CROSS':
-            current_rsi = ta.rsi(df_5m['close'], length=14).iloc[-1]
-            if direction == 'ABOVE' and current_rsi >= level: return True
-            if direction == 'BELOW' and current_rsi <= level: return True
+        if df_5m.empty: return False
+
+        # --- Pre-calculation for indicators ---
+        # This ensures we calculate indicators only once if multiple triggers need them.
+        latest_candle = df_5m.iloc[-1]
+        
+        try:
+            # --- TYPE 1: PRICE_CROSS ---
+            if trigger_type == 'PRICE_CROSS':
+                level = float(trigger.get('level', 0))
+                direction = trigger.get('direction')
+                if direction == 'ABOVE' and latest_candle['high'] >= level: return True
+                if direction == 'BELOW' and latest_candle['low'] <= level: return True
+
+            # --- TYPE 2: RSI_CROSS ---
+            elif trigger_type == 'RSI_CROSS':
+                level = float(trigger.get('level', 0))
+                direction = trigger.get('direction')
+                current_rsi = ta.rsi(df_5m['close'], length=14).iloc[-1]
+                if direction == 'ABOVE' and current_rsi >= level: return True
+                if direction == 'BELOW' and current_rsi <= level: return True
+
+            # --- NEW TYPE 3: EMA_CROSS ---
+            elif trigger_type == 'EMA_CROSS':
+                fast_period = int(trigger.get('fast', 20))
+                slow_period = int(trigger.get('slow', 50))
+                direction = trigger.get('direction')
+                
+                ema_fast = ta.ema(df_5m['close'], length=fast_period)
+                ema_slow = ta.ema(df_5m['close'], length=slow_period)
+                
+                # Golden Cross: Fast EMA crosses ABOVE Slow EMA
+                if direction == 'GOLDEN' and ema_fast.iloc[-2] < ema_slow.iloc[-2] and ema_fast.iloc[-1] >= ema_slow.iloc[-1]:
+                    return True
+                # Death Cross: Fast EMA crosses BELOW Slow EMA
+                if direction == 'DEATH' and ema_fast.iloc[-2] > ema_slow.iloc[-2] and ema_fast.iloc[-1] <= ema_slow.iloc[-1]:
+                    return True
+
+            # --- NEW TYPE 4: PRICE_EMA_DISTANCE ---
+            elif trigger_type == 'PRICE_EMA_DISTANCE':
+                period = int(trigger.get('period', 20))
+                target_pct = float(trigger.get('percent', 0))
+                condition = trigger.get('condition') # 'ABOVE' or 'BELOW'
+                
+                ema = ta.ema(df_5m['close'], length=period).iloc[-1]
+                distance_pct = ((latest_candle['close'] - ema) / ema) * 100
+                
+                if condition == 'BELOW' and distance_pct <= target_pct: return True
+                if condition == 'ABOVE' and distance_pct >= target_pct: return True
+
+            # --- NEW TYPE 5: BBAND_WIDTH ---
+            elif trigger_type == 'BBAND_WIDTH':
+                period = int(trigger.get('period', 20))
+                target_pct = float(trigger.get('percent', 0))
+                condition = trigger.get('condition') # 'BELOW' (squeeze) or 'ABOVE' (expansion)
+                
+                bbands = ta.bbands(df_5m['close'], length=period)
+                # Calculate Bollinger Band Width Percentage
+                bb_width_pct = ((bbands[f'BBU_{period}_2.0'] - bbands[f'BBL_{period}_2.0']) / bbands[f'BBM_{period}_2.0'] * 100).iloc[-1]
+
+                if condition == 'BELOW' and bb_width_pct <= target_pct: return True
+                if condition == 'ABOVE' and bb_width_pct >= target_pct: return True
+
+            # --- NEW TYPE 6: MACD_HIST_SIGN ---
+            elif trigger_type == 'MACD_HIST_SIGN':
+                condition = trigger.get('condition') # 'POSITIVE' or 'NEGATIVE'
+                macd = ta.macd(df_5m['close'])
+                hist = macd['MACDh_12_26_9']
+                
+                # Crosses to positive
+                if condition == 'POSITIVE' and hist.iloc[-2] <= 0 and hist.iloc[-1] > 0: return True
+                # Crosses to negative
+                if condition == 'NEGATIVE' and hist.iloc[-2] >= 0 and hist.iloc[-1] < 0: return True
+
+        except Exception as e:
+            add_log(f"⚠️ Error evaluating trigger '{trigger.get('label')}': {e}", self.symbol)
+            return False
+            
         return False
 
 # --- Main Bot Execution Loop ---
@@ -149,12 +217,15 @@ def main():
     for symbol in config.SYMBOLS_TO_TRADE:
         BOT_STATE[symbol] = {
             "trigger_manager": DynamicTriggerManager(symbol), 
-            "market_context": load_market_context(symbol), 
+            # ################## START OF MODIFIED SECTION ##############################
+            # 2. USE A DEQUE TO STORE A HISTORY OF CONTEXTS (e.g., last 12 analyses = 1 hour)
+            "market_context_history": deque(maxlen=12), 
+            # ################### END OF MODIFIED SECTION ###############################
             "last_decision": {}, 
-            # CORE CHANGE: Re-instated trailing stop parameters in the state
             "trade_state": {"current_stop_loss": None, "trailing_distance_pct": None}, 
             "was_in_position": False, "current_position": {"side": None},
-            "last_ai_response": "No analysis yet.", "last_sentiment_score": 0.0, "last_known_price": 0.0
+            "last_ai_response": "No analysis yet.", "chain_of_thought": "No thought process recorded yet.",
+            "last_sentiment_score": 0.0, "last_known_price": 0.0
         }
 
     add_log("💧 Hydrating full historical data for all symbols sequentially...")
@@ -262,14 +333,31 @@ def main():
                     symbol_state['last_sentiment_score'] = sentiment_score
                     
                     pos_report = f"Side: {pos.get('side', 'FLAT')}, Entry: {pos.get('entry_price', 0):.4f}"
-                    context_summary = json.dumps(symbol_state['market_context'])
+                    # ################## START OF MODIFIED SECTION ##############################
+                    # 3. FORMAT THE HISTORY OF CONTEXTS INTO A STRING FOR THE AI
+                    context_history_list = list(symbol_state['market_context_history'])
+                    context_summary_string = "No historical analysis available yet."
+                    if context_history_list:
+                        formatted_contexts = []
+                        # Iterate in reverse to show the most recent analysis first
+                        for i, context in enumerate(reversed(context_history_list)):
+                            # The timestamp is already in the context dict, added by parse_context_block
+                            ts = context.get('last_full_analysis_timestamp', 'N/A').split('T')[1].split('.')[0]
+                            formatted_contexts.append(f"--- Analysis @ {ts} UTC ({i*5} mins ago) ---\n" + json.dumps(context, indent=2))
+                        context_summary_string = "\n\n".join(formatted_contexts)
+                    # ################### END OF MODIFIED SECTION ###############################
                     
-                    decision, new_context, raw_response = get_ai_decision_sync(
-                        analysis_bundle, pos_report, context_summary, vitals['total_equity'], sentiment_score
+                    decision, new_context, raw_response, chain_of_thought = get_ai_decision_sync(
+                        analysis_bundle, pos_report, context_summary_string, vitals['total_equity'], sentiment_score
                     )
                     symbol_state['last_ai_response'] = raw_response
+                    symbol_state['chain_of_thought'] = chain_of_thought # Store the thought process
                     
-                    if new_context: symbol_state['market_context'] = new_context
+                    # Log the thought process for immediate debugging
+                    add_log(f"AI Chain of Thought:\n--- START ---\n{chain_of_thought}\n--- END ---", symbol)
+                    
+                    if new_context: 
+                        symbol_state['market_context_history'].append(new_context)
                     
                     if decision and decision.get('action'):
                         symbol_state['last_decision'] = decision
@@ -324,9 +412,11 @@ def main():
                         symbol_state['trigger_manager'].set_triggers(decision)
                 
                 update_bot_state(symbol, is_in_position, pos, {
-                    'market_context': symbol_state['market_context'],
+                    # Pass the list representation of the deque for JSON serialization
+                    'market_context': list(symbol_state['market_context_history']),
                     'active_triggers': symbol_state['trigger_manager'].triggers,
                     'last_ai_response': symbol_state['last_ai_response'],
+                    'chain_of_thought': symbol_state['chain_of_thought'], # Pass to DB
                     'last_sentiment_score': symbol_state['last_sentiment_score'],
                     'last_known_price': symbol_state['last_known_price']
                 })

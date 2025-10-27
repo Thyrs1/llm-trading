@@ -191,6 +191,14 @@ def parse_context_block(raw_text: str) -> Dict:
     if context: context['last_full_analysis_timestamp'] = datetime.now(timezone.utc).isoformat()
     return context
 
+def parse_chain_of_thought_block(raw_text: str) -> str:
+    """Extracts the content of the [CHAIN_OF_THOUGHT_BLOCK]."""
+    try:
+        thought_process = raw_text.split('[CHAIN_OF_THOUGHT_BLOCK]')[1].split('[END_CHAIN_OF_THOUGHT_BLOCK]')[0].strip()
+        return thought_process
+    except IndexError:
+        return "No Chain of Thought block found in AI response."
+
 def process_klines(klines: List[List]) -> pd.DataFrame:
     df = pd.DataFrame(klines, columns=['date', 'open', 'high', 'low', 'close', 'volume'])
     df['date'] = pd.to_datetime(df['date'], unit='ms')
@@ -199,32 +207,70 @@ def process_klines(klines: List[List]) -> pd.DataFrame:
     return df[['open', 'high', 'low', 'close', 'volume']].astype(float)
 
 def analyze_freqtrade_data(df_5m: pd.DataFrame, current_price: float) -> str:
+    """
+    Performs a hybrid technical analysis, providing both the latest indicator value,
+    its change from the previous candle (Delta), and a short-term history list.
+    """
     if len(df_5m) < 60: return "Insufficient data for meaningful analysis."
     df_5m_clean = df_5m[~df_5m.index.duplicated(keep='last')]
     if len(df_5m_clean) < 60: return "Insufficient unique data for meaningful analysis."
+    
     analysis_report = f"### 0. Current Market Price (Anchor)\n- **Current Price:** {current_price:.4f} USDT\n\n"
-    analysis_report += "### 1. Freqtrade Multi-Timeframe Analysis\n"
-    timeframe_settings = {'1d': '1d', '4h': '4h', '1h': '1h', '15m': '15Min', '5m': '5Min'}
+    analysis_report += "### 1. Multi-Timeframe Hybrid Technical Analysis\n"
+    
+    timeframe_settings = {'1d': '1d', '4h': '4h', '1h': '1h', '15m': '15Min'}
+    
     for tf_name, rule in timeframe_settings.items():
-        if len(df_5m_clean) < 20 and tf_name != '5m':
-            analysis_report += f"--- Report ({tf_name}) ---\nInsufficient data for {tf_name} resampling.\n"
-            continue
-        df_tf = df_5m_clean.copy() if tf_name == '5m' else df_5m_clean.resample(rule).agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
-        if len(df_tf) < 50:
-            analysis_report += f"--- Report ({tf_name}) ---\nInsufficient data for {tf_name} indicators.\n"
-            continue
-        df_tf.ta.ema(length=20, append=True)
-        df_tf.ta.ema(length=50, append=True)
-        df_tf.ta.rsi(length=14, append=True)
-        df_tf.ta.adx(length=14, append=True)
-        df_tf.ta.macd(close=df_tf['close'], append=True)
-        latest = df_tf.iloc[-1]
-        ema_20 = latest.get('EMA_20', 0)
-        ema_50 = latest.get('EMA_50', 0)
-        trend = "BULLISH" if ema_20 > ema_50 else "BEARISH" if ema_20 < ema_50 else "RANGING"
-        analysis_report += f"--- Report ({tf_name}) ---\n"
-        analysis_report += f"Close: {latest['close']:.4f}, Trend: {trend}\n"
-        analysis_report += f"RSI: {latest.get('RSI_14', 50):.2f}, ADX: {latest.get('ADX_14', 0):.2f}, MACD_Hist: {latest.get('MACDh_12_26_9', 0):.4f}\n"
+        try:
+            df_tf = df_5m_clean.resample(rule).agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
+            if len(df_tf) < 50:
+                analysis_report += f"--- Report ({tf_name}) ---\nInsufficient data for {tf_name} indicators.\n"
+                continue
+
+            # --- Calculate All Indicators ---
+            df_tf.ta.ema(length=20, append=True)
+            df_tf.ta.ema(length=50, append=True)
+            df_tf.ta.rsi(length=14, append=True)
+            df_tf.ta.adx(length=14, append=True)
+            df_tf.ta.macd(append=True)
+            df_tf.ta.bbands(length=20, append=True)
+            df_tf.ta.obv(append=True)
+            
+            # --- Extract Last 5 Candles for History & Delta ---
+            last_five = df_tf.iloc[-5:]
+            if len(last_five) < 2: continue # Need at least 2 candles for delta
+            
+            latest = last_five.iloc[-1]
+            previous = last_five.iloc[-2]
+
+            # --- Trend Analysis ---
+            trend = "BULLISH" if latest.get('EMA_20', 0) > latest.get('EMA_50', 0) else "BEARISH" if latest.get('EMA_20', 0) < latest.get('EMA_50', 0) else "RANGING"
+
+            # --- Hybrid Data Extraction (Value, Delta, History) ---
+            # RSI
+            rsi_delta = latest.get('RSI_14', 0) - previous.get('RSI_14', 0)
+            rsi_history = last_five['RSI_14'].round(2).tolist()
+            # MACD Histogram
+            macd_hist_delta = latest.get('MACDh_12_26_9', 0) - previous.get('MACDh_12_26_9', 0)
+            macd_hist_history = last_five['MACDh_12_26_9'].round(4).tolist()
+            # OBV (On-Balance Volume)
+            obv_ema = ta.ema(df_tf['OBV'], length=10)
+            obv_ema_history = obv_ema.iloc[-5:].round(0).tolist() if not obv_ema.empty else []
+
+            # --- Bollinger Bands Analysis ---
+            bb_pos = "Above Upper Band" if latest['close'] > latest.get('BBU_20_2.0', 0) else "Below Lower Band" if latest['close'] < latest.get('BBL_20_2.0', 0) else "Between Bands"
+
+            # --- Format the Report String ---
+            analysis_report += f"--- Report ({tf_name}) ---\n"
+            analysis_report += f"Close: {latest['close']:.4f}, Trend: {trend}\n"
+            analysis_report += f"RSI: {latest.get('RSI_14', 50):.2f} (Δ: {rsi_delta:+.2f}) | History: {rsi_history}\n"
+            analysis_report += f"MACD Hist: {latest.get('MACDh_12_26_9', 0):.4f} (Δ: {macd_hist_delta:+.4f}) | History: {macd_hist_history}\n"
+            analysis_report += f"ADX: {latest.get('ADX_14', 0):.2f}, BBands: {bb_pos}\n"
+            analysis_report += f"OBV EMA(10) History: {obv_ema_history}\n"
+
+        except Exception as e:
+            analysis_report += f"--- Report ({tf_name}) ---\nError during analysis: {e}\n"
+            
     return analysis_report
 
 def get_ai_decision_sync(analysis_data: str, position_data: str, context_summary: str, live_equity: float, sentiment_score: float) -> Tuple[Dict, Dict, str]:
@@ -260,7 +306,8 @@ Current News Sentiment Score: {sentiment_score:.2f} (-1 Negative, +1 Positive).
         raw_response_text = response.choices[0].message.content
         decision_dict = parse_decision_block(raw_response_text)
         context_dict = parse_context_block(raw_response_text)
-        return decision_dict, context_dict, raw_response_text
+        chain_of_thought = parse_chain_of_thought_block(raw_response_text)
+        return decision_dict, context_dict, raw_response_text, chain_of_thought # <--- RETURN THE THOUGHTS
     except Exception:
         print(f"❌ Unexpected Error in AI call: {traceback.format_exc()}")
         return {}, {}, ""
