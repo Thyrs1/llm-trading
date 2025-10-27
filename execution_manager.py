@@ -96,6 +96,19 @@ class ExchangeManager:
         except Exception as e:
             print(f"❌ Error fetching account vitals: {e}")
             return {'total_equity': 0.0, 'available_margin': 0.0}
+    
+    def get_orderbook_ticker(self, symbol: str) -> Dict:
+        """Fetches the best bid and ask prices from the order book."""
+        try:
+            # fetchTicker is more efficient than fetchOrderBook for just the top level
+            ticker = self.client.fetch_ticker(symbol)
+            return {
+                'bid': ticker.get('bid'),
+                'ask': ticker.get('ask')
+            }
+        except Exception as e:
+            print(f"⚠️ Could not fetch orderbook ticker for {symbol}: {e}", symbol)
+            return {}
 
     def get_current_mark_price(self, symbol: str) -> float:
         """Fetches the current mark price for a specific symbol."""
@@ -145,7 +158,7 @@ class ExchangeManager:
             
             order = self.client.create_order(
                 symbol=symbol, type='LIMIT', side=ccxt_side,
-                amount=formatted_quantity, price=formatted_price, params={'postOnly': True}
+                amount=formatted_quantity, price=formatted_price
             )
             return {'status': 'success', 'order': order}
         except ccxt.InsufficientFunds as e:
