@@ -385,7 +385,24 @@ def main():
                                 decision['quantity'] = qty
                                 
                                 if qty > 0:
-                                    res = exchange.place_limit_order(symbol, decision['decision'], qty, decision['entry_price'])
+                                    ai_entry_price = decision.get('entry_price', 0)
+                                    adjusted_entry_price = 0
+                                    
+                                    # For a LONG (buy) order, we place it slightly BELOW the AI's price
+                                    # to ensure it rests on the bid side of the order book.
+                                    if decision.get('decision') == 'LONG':
+                                        adjusted_entry_price = ai_entry_price * 0.9995 # 0.05% below
+                                    
+                                    # For a SHORT (sell) order, we place it slightly ABOVE the AI's price
+                                    # to ensure it rests on the ask side of the order book.
+                                    elif decision.get('decision') == 'SHORT':
+                                        adjusted_entry_price = ai_entry_price * 1.0005 # 0.05% above
+                                    
+                                    if adjusted_entry_price > 0:
+                                        add_log(f"Adjusting entry price for Maker order. AI Price: {ai_entry_price}, Adjusted Price: {adjusted_entry_price}", symbol)
+                                        res = exchange.place_limit_order(symbol, decision['decision'], qty, adjusted_entry_price)
+                                    else:
+                                        res = {'status': 'error', 'message': 'Invalid decision side for price adjustment.'}
                                     if res['status'] == 'success':
                                         add_log(f"✅ Entry order placed for {symbol}. Setting SL/TP.", symbol)
                                         time.sleep(2) 
