@@ -174,17 +174,12 @@ def main():
             "market_context_history": deque(maxlen=12), 
             "last_decision": {}, 
             "trade_state": {
-                "pending_order_id": None,
-                "stop_loss_order_id": None,
-                "take_profit_order_id": None,
-                "current_stop_loss": None,
-                "trailing_distance_pct": None
+                "pending_order_id": None, "stop_loss_order_id": None, "take_profit_order_id": None,
+                "current_stop_loss": None, "trailing_distance_pct": None
             }, 
             "was_in_position": False, "current_position": {"side": None},
-            "last_ai_response": "No analysis yet.",
-            "chain_of_thought": "No thought process recorded yet.",
-            "last_sentiment_score": 0.0, 
-            "last_known_price": 0.0
+            "last_ai_response": "No analysis yet.", "chain_of_thought": "No thought process recorded yet.",
+            "last_sentiment_score": 0.0, "last_known_price": 0.0
         }
 
     add_log("💧 Hydrating full historical data for all symbols sequentially...")
@@ -200,6 +195,7 @@ def main():
     while True:
         start_time = time.time()
         try:
+            # ... (Risk management logic remains the same) ...
             now = datetime.now()
             if now.day != RISK_STATE["last_check_day"]:
                 vitals = exchange.get_account_vitals()
@@ -209,8 +205,7 @@ def main():
                 add_log(f"☀️ New trading day. Daily start equity set to: ${RISK_STATE['daily_start_equity']:.2f}", "RISK_MANAGER")
             
             if RISK_STATE["is_trading_halted"] and time.time() < RISK_STATE["halt_until_timestamp"]:
-                if now.day != RISK_STATE["last_check_day"]: # Allow daily reset to override halt
-                    pass
+                if now.day != RISK_STATE["last_check_day"]: pass
                 else:
                     add_log(f"Trading is paused. Resumes at {datetime.fromtimestamp(RISK_STATE['halt_until_timestamp']).strftime('%H:%M:%S')}.", "RISK_MANAGER",)
                     time.sleep(config.FAST_CHECK_INTERVAL)
@@ -245,7 +240,6 @@ def main():
                 pos = open_positions_map.get(symbol, {"side": None})
                 is_in_position = pos.get('side') is not None
                 
-                # --- CORE LOGIC REFACTOR: State Machine for Order Lifecycle ---
                 if is_in_position and symbol_state['trade_state'].get('pending_order_id'):
                     add_log(f"✅ Limit order {symbol_state['trade_state']['pending_order_id']} filled. Position is now active.", symbol)
                     decision = symbol_state['last_decision']
@@ -265,7 +259,16 @@ def main():
                     combined_df = pd.concat([HISTORICAL_DATA.get(symbol, pd.DataFrame()), df_5m_update])
                     combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
                     combined_df.sort_index(inplace=True)
-                    HISTORICAL_DATA[symbol] = combined_df.tail(18000)
+                    # ########################################################################### #
+                    # ################## START OF MODIFIED SECTION ############################## #
+                    # ########################################################################### #
+                    # CRITICAL FIX: Ensure we keep enough data for 210 days.
+                    # 210 days * 288 (5m candles per day) = 60480. We'll keep a buffer.
+                    HISTORICAL_DATA[symbol] = combined_df.tail(61000)
+                    # ########################################################################### #
+                    # ################### END OF MODIFIED SECTION ############################### #
+                    # ########################################################################### #
+                
                 if HISTORICAL_DATA[symbol].empty: continue
                 current_price = exchange.get_current_mark_price(symbol)
                 symbol_state['last_known_price'] = current_price
@@ -296,6 +299,7 @@ def main():
                         summarize_and_learn_sync(trade_summary, symbol)
                 symbol_state['was_in_position'] = is_in_position
 
+                # ... (The rest of the file, including trailing stop, AI analysis, and order placement, remains the same) ...
                 if is_in_position:
                     current_sl = symbol_state['trade_state'].get('current_stop_loss')
                     trail_pct = symbol_state['trade_state'].get('trailing_distance_pct')

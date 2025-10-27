@@ -53,9 +53,6 @@ class ExchangeManager:
                     print("❌ All attempts to connect and load markets have failed. Aborting.")
                     return False
 
-    # ########################################################################### #
-    # ################## START OF MODIFIED SECTION ############################## #
-    # ########################################################################### #
     def get_account_vitals(self) -> Dict[str, float]:
         """Synchronously retrieves global account equity and available margin."""
         try:
@@ -77,9 +74,6 @@ class ExchangeManager:
         except Exception as e:
             print(f"❌ Error fetching mark price for {symbol}: {e}")
             return 0.0
-    # ########################################################################### #
-    # ################### END OF MODIFIED SECTION ############################### #
-    # ########################################################################### #
 
     def set_leverage_for_symbol(self, symbol: str, leverage: int):
         """Sets the leverage for a specific symbol."""
@@ -226,22 +220,39 @@ class ExchangeManager:
             print(f"❌ Error fetching trade list for {symbol}: {e}")
             return []
             
+    # ########################################################################### #
+    # ################## START OF MODIFIED SECTION ############################## #
+    # ########################################################################### #
     def fetch_positions(self, symbols: List[str]) -> List[Dict]:
-        """Fetches current position details for a list of symbols."""
+        """
+        Fetches current position details for a list of symbols, ensuring correct
+        and reliable retrieval by passing the symbols list to the underlying CCXT call.
+        """
+        if not symbols:
+            return []
         try:
-            positions = self.client.fetch_positions(symbols)
+            # CRITICAL FIX: Pass the 'symbols' list directly to the ccxt call.
+            # This is the most robust way to ensure we get immediate and accurate
+            # position data for the symbols we care about.
+            positions = self.client.fetch_positions(symbols=symbols)
+            
             active_positions = []
             for pos in positions:
                 if pos.get('contracts') is not None and float(pos['contracts']) != 0:
                     active_positions.append({
-                        "symbol": pos['symbol'], "side": pos['side'].upper(),
-                        "quantity": float(pos['contracts']), "entry_price": float(pos['entryPrice']),
+                        "symbol": pos['symbol'], 
+                        "side": pos['side'].upper(),
+                        "quantity": float(pos['contracts']), 
+                        "entry_price": float(pos['entryPrice']),
                         "unrealized_pnl": float(pos.get('unrealizedPnl', 0.0))
                     })
             return active_positions
         except Exception as e:
             print(f"❌ Error fetching positions: {e}")
             return []
+    # ########################################################################### #
+    # ################### END OF MODIFIED SECTION ############################### #
+    # ########################################################################### #
 
     def fetch_historical_klines(self, symbols: List[str], timeframe: str, limit: int) -> Dict[str, List[List]]:
         """Fetches klines for multiple symbols sequentially."""

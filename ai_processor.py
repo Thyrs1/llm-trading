@@ -38,9 +38,6 @@ def init_finbert_analyzer():
     if sentiment_analyzer is not None: return
     print("🤖 Initializing FinBERT instance in main thread...")
     try:
-        # Temporarily disable this function to prevent segfault for debugging
-        # print("⚠️ FinBERT sentiment analysis is DISABLED for debugging.")
-        # pass
         device = 0 if torch.cuda.is_available() else -1
         if device == 0: print(f"✅ CUDA available. Loading FinBERT on GPU.")
         else: print("⚠️ CUDA not found. Loading FinBERT on CPU.")
@@ -65,12 +62,8 @@ def init_finbert_analyzer():
 def get_sentiment_score_sync(text: str) -> float:
     """Synchronously performs sentiment analysis."""
     global sentiment_analyzer
-    if sentiment_analyzer is None:
-        # init_finbert_analyzer() # Let the main loop handle initialization
-        return 0.0 # Return neutral if not initialized
-    
-    if not text or len(text) < 10:
-        return 0.0
+    if sentiment_analyzer is None: return 0.0
+    if not text or len(text) < 10: return 0.0
     try:
         results = sentiment_analyzer(text, max_length=512, truncation=True)
         score = 0.0
@@ -197,6 +190,8 @@ def analyze_freqtrade_data(df_5m: pd.DataFrame, current_price: float) -> str:
             if len(df_tf) < 50:
                 analysis_report += f"--- Report ({tf_name}) ---\nInsufficient data for {tf_name} indicators.\n"
                 continue
+            
+            # Use append=False to get a separate DataFrame for indicators, which is cleaner
             df_tf.ta.ema(length=20, append=True)
             df_tf.ta.ema(length=50, append=True)
             df_tf.ta.rsi(length=14, append=True)
@@ -204,6 +199,7 @@ def analyze_freqtrade_data(df_5m: pd.DataFrame, current_price: float) -> str:
             df_tf.ta.macd(append=True)
             df_tf.ta.bbands(length=20, append=True)
             df_tf.ta.obv(append=True)
+            
             last_five = df_tf.iloc[-5:]
             if len(last_five) < 2: continue
             latest = last_five.iloc[-1]
@@ -215,7 +211,14 @@ def analyze_freqtrade_data(df_5m: pd.DataFrame, current_price: float) -> str:
             macd_hist_history = last_five['MACDh_12_26_9'].round(4).tolist()
             obv_ema = ta.ema(df_tf['OBV'], length=10)
             obv_ema_history = obv_ema.iloc[-5:].round(0).tolist() if not obv_ema.empty else []
-            bb_pos = "Above Upper Band" if latest['close'] > latest.get('BBU_20_2.0', 0) else "Below Lower Band" if latest['close'] < latest.get('BBL_20_2.0', 0) else "Between Bands"
+            
+            # Robustly access bbands columns
+            bbu_col = next((col for col in df_tf.columns if col.startswith('BBU_')), None)
+            bbl_col = next((col for col in df_tf.columns if col.startswith('BBL_')), None)
+            bb_pos = "N/A"
+            if bbu_col and bbl_col:
+                bb_pos = "Above Upper Band" if latest['close'] > latest.get(bbu_col, 0) else "Below Lower Band" if latest['close'] < latest.get(bbl_col, 0) else "Between Bands"
+
             analysis_report += f"--- Report ({tf_name}) ---\n"
             analysis_report += f"Close: {latest['close']:.4f}, Trend: {trend}\n"
             analysis_report += f"RSI: {latest.get('RSI_14', 50):.2f} (Δ: {rsi_delta:+.2f}) | History: {rsi_history}\n"
@@ -226,9 +229,6 @@ def analyze_freqtrade_data(df_5m: pd.DataFrame, current_price: float) -> str:
             analysis_report += f"--- Report ({tf_name}) ---\nError during analysis: {e}\n"
     return analysis_report
 
-# ########################################################################### #
-# ################## START OF MODIFIED SECTION ############################## #
-# ########################################################################### #
 def get_market_regime(df_1d: pd.DataFrame) -> str:
     """Determines the overall market regime based on long-term indicators."""
     if len(df_1d) < 200:
@@ -236,22 +236,40 @@ def get_market_regime(df_1d: pd.DataFrame) -> str:
     try:
         ema_200 = ta.ema(df_1d['close'], length=200).iloc[-1]
         latest_close = df_1d['close'].iloc[-1]
-        bbands = ta.bbands(df_1d['close'], length=20)
-        bb_width_pct = ((bbands['BBU_20_2.0'] - bbands['BBL_20_2.0']) / bbands['BBM_20_2.0'] * 100).iloc[-1]
+        
+        # ########################################################################### #
+        # ################## START OF MODIFIED SECTION ############################## #
+        # ########################################################################### #
+        # CRITICAL FIX: Calculate bbands as a separate DataFrame to access columns by index
+        bbands = ta.bbands(df_1d['close'], length=20, std=2)
+        
+        # bbands DataFrame columns are reliably ordered: BBL, BBM, BBU, BBB, BBP
+        bbl = bbands.iloc[:, 0] # Lower Band
+        bbm = bbands.iloc[:, 1] # Middle Band
+        bbu = bbands.iloc[:, 2] # Upper Band
+        
+        bb_width_pct = ((bbu - bbl) / bbm * 100).iloc[-1]
+        # ########################################################################### #
+        # ################### END OF MODIFIED SECTION ############################### #
+        # ########################################################################### #
+
         regime = ""
         if latest_close > ema_200:
             regime = "BULLISH TREND"
         else:
             regime = "BEARISH TREND"
-        if bb_width_pct < 15:
-            regime = "RANGING / CONSOLIDATION"
+        
+        # Example threshold for low volatility on a daily chart
+        if bb_width_pct < 15: 
+            # If the trend is strong, consolidation is just a pause. Otherwise, it's ranging.
+            adx = ta.adx(df_1d['high'], df_1d['low'], df_1d['close'], length=14)
+            if adx is not None and not adx.empty and adx.iloc[-1, 0] < 25:
+                 regime = "RANGING / CONSOLIDATION"
+        
         return regime
     except Exception as e:
         print(f"⚠️ Error calculating market regime: {e}")
         return "UNCLEAR (Calculation Error)"
-# ########################################################################### #
-# ################### END OF MODIFIED SECTION ############################### #
-# ########################################################################### #
 
 def get_ai_decision_sync(analysis_data: str, position_data: str, context_summary: str, live_equity: float, sentiment_score: float, market_regime: str) -> Tuple[Dict, Dict, str, str]:
     """Synchronously retrieves decision, context, raw response, and thoughts from the AI."""
