@@ -38,6 +38,9 @@ def init_finbert_analyzer():
     if sentiment_analyzer is not None: return
     print("🤖 Initializing FinBERT instance in main thread...")
     try:
+        # Temporarily disable this function to prevent segfault for debugging
+        # print("⚠️ FinBERT sentiment analysis is DISABLED for debugging.")
+        # pass
         device = 0 if torch.cuda.is_available() else -1
         if device == 0: print(f"✅ CUDA available. Loading FinBERT on GPU.")
         else: print("⚠️ CUDA not found. Loading FinBERT on CPU.")
@@ -63,9 +66,10 @@ def get_sentiment_score_sync(text: str) -> float:
     """Synchronously performs sentiment analysis."""
     global sentiment_analyzer
     if sentiment_analyzer is None:
-        init_finbert_analyzer()
+        # init_finbert_analyzer() # Let the main loop handle initialization
+        return 0.0 # Return neutral if not initialized
     
-    if not sentiment_analyzer or not text or len(text) < 10:
+    if not text or len(text) < 10:
         return 0.0
     try:
         results = sentiment_analyzer(text, max_length=512, truncation=True)
@@ -83,7 +87,7 @@ def get_news_from_rss(symbol: str, limit=10) -> str:
     rss_feeds = ["https://cointelegraph.com/rss", "https://www.coindesk.com/arc/outboundfeeds/rss/"]
     relevant_headlines = []
     base_symbol = symbol.split('/')[0]
-    coin_names = {'SOL': ['solana'], 'BTC': ['bitcoin'], 'ETH': ['ethereum']}
+    coin_names = {'SOL': ['solana'], 'BTC': ['bitcoin'], 'ETH': ['ethereum'], 'BNB': ['binance coin'], 'XRP': ['ripple']}
     search_terms = [base_symbol.lower()] + coin_names.get(base_symbol.upper(), [])
     pattern = re.compile(r'\b(' + '|'.join(search_terms) + r')\b', re.IGNORECASE)
     for url in rss_feeds:
@@ -97,75 +101,53 @@ def get_news_from_rss(symbol: str, limit=10) -> str:
     return ". ".join(list(dict.fromkeys(relevant_headlines))[:limit])
 
 def parse_decision_block(raw_text: str) -> Dict:
-    """
-    Parses [DECISION_BLOCK] using a hybrid approach. It handles simple KEY: VALUE lines
-    and also detects and parses a multi-line JSON value for the 'TRIGGERS' key.
-    """
     decision = {}
     try:
         decision_str = raw_text.split('[DECISION_BLOCK]')[1].split('[END_BLOCK]')[0].strip()
     except IndexError:
         print("⚠️ [DECISION_BLOCK] not found in AI response.")
         return {}
-
     lines = decision_str.splitlines()
     json_buffer = ""
     in_json_block = False
-
-    type_map = {
-        "ENTRY_PRICE": float, "STOP_LOSS": float, "TAKE_PROFIT": float, "LEVERAGE": int,
-        "RISK_PERCENT": float, "TRAILING_ACTIVATION_PRICE": float, "TRAILING_DISTANCE_PCT": float,
-        "NEW_STOP_LOSS": float, "NEW_TAKE_PROFIT": float, "TRIGGER_PRICE": float, 
-        "TRIGGER_LEVEL": float, "TRIGGER_TIMEOUT": int
-    }
-
+    type_map = {"ENTRY_PRICE": float, "STOP_LOSS": float, "TAKE_PROFIT": float, "LEVERAGE": int, "RISK_PERCENT": float, "TRAILING_DISTANCE_PCT": float, "NEW_STOP_LOSS": float, "NEW_TAKE_PROFIT": float, "TRIGGER_TIMEOUT": int}
     for line in lines:
         stripped_line = line.strip()
-        
-        # State machine to handle the TRIGGERS JSON block
         if stripped_line.upper().startswith("TRIGGERS:"):
             in_json_block = True
-            # Start capturing the JSON from the opening bracket
-            try:
-                json_buffer += stripped_line.split(':', 1)[1].strip()
-            except IndexError:
-                pass # Handles case where '[' is on the next line
+            try: json_buffer += stripped_line.split(':', 1)[1].strip()
+            except IndexError: pass
             continue
-
         if in_json_block:
             json_buffer += stripped_line
-            # If we find the closing bracket, the block is complete
             if stripped_line.endswith("]"):
                 try:
-                    # Clean up the buffer and parse as JSON
                     clean_json = json_buffer.strip().strip(',')
                     decision['triggers'] = json.loads(clean_json)
                 except json.JSONDecodeError as e:
                     print(f"❌ Failed to parse TRIGGERS JSON block: {e}\nBlock content was: {json_buffer}")
-                # Reset state machine
                 in_json_block = False
                 json_buffer = ""
-        
-        # If not in a JSON block, parse as a simple KEY: VALUE pair
         else:
             if ':' in line:
                 key, value = line.split(':', 1)
                 key, value = key.strip().upper(), value.strip()
                 key_lower = key.lower()
-
-                # Skip TRIGGERS key if it's handled separately
-                if key_lower == 'triggers':
-                    continue
-
+                if key_lower == 'triggers': continue
                 if key in type_map:
-                    try:
-                        decision[key_lower] = type_map[key](value)
-                    except (ValueError, TypeError):
-                        decision[key_lower] = None
+                    try: decision[key_lower] = type_map[key](value)
+                    except (ValueError, TypeError): decision[key_lower] = None
                 else:
                     decision[key_lower] = value
-                    
     return decision
+
+def parse_chain_of_thought_block(raw_text: str) -> str:
+    """Extracts the content of the [CHAIN_OF_THOUGHT_BLOCK]."""
+    try:
+        thought_process = raw_text.split('[CHAIN_OF_THOUGHT_BLOCK]')[1].split('[END_CHAIN_OF_THOUGHT_BLOCK]')[0].strip()
+        return thought_process
+    except IndexError:
+        return "No Chain of Thought block found in AI response."
 
 def parse_context_block(raw_text: str) -> Dict:
     context = {}
@@ -191,14 +173,6 @@ def parse_context_block(raw_text: str) -> Dict:
     if context: context['last_full_analysis_timestamp'] = datetime.now(timezone.utc).isoformat()
     return context
 
-def parse_chain_of_thought_block(raw_text: str) -> str:
-    """Extracts the content of the [CHAIN_OF_THOUGHT_BLOCK]."""
-    try:
-        thought_process = raw_text.split('[CHAIN_OF_THOUGHT_BLOCK]')[1].split('[END_CHAIN_OF_THOUGHT_BLOCK]')[0].strip()
-        return thought_process
-    except IndexError:
-        return "No Chain of Thought block found in AI response."
-
 def process_klines(klines: List[List]) -> pd.DataFrame:
     df = pd.DataFrame(klines, columns=['date', 'open', 'high', 'low', 'close', 'volume'])
     df['date'] = pd.to_datetime(df['date'], unit='ms')
@@ -214,20 +188,15 @@ def analyze_freqtrade_data(df_5m: pd.DataFrame, current_price: float) -> str:
     if len(df_5m) < 60: return "Insufficient data for meaningful analysis."
     df_5m_clean = df_5m[~df_5m.index.duplicated(keep='last')]
     if len(df_5m_clean) < 60: return "Insufficient unique data for meaningful analysis."
-    
     analysis_report = f"### 0. Current Market Price (Anchor)\n- **Current Price:** {current_price:.4f} USDT\n\n"
     analysis_report += "### 1. Multi-Timeframe Hybrid Technical Analysis\n"
-    
     timeframe_settings = {'1d': '1d', '4h': '4h', '1h': '1h', '15m': '15Min'}
-    
     for tf_name, rule in timeframe_settings.items():
         try:
             df_tf = df_5m_clean.resample(rule).agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
             if len(df_tf) < 50:
                 analysis_report += f"--- Report ({tf_name}) ---\nInsufficient data for {tf_name} indicators.\n"
                 continue
-
-            # --- Calculate All Indicators ---
             df_tf.ta.ema(length=20, append=True)
             df_tf.ta.ema(length=50, append=True)
             df_tf.ta.rsi(length=14, append=True)
@@ -235,63 +204,81 @@ def analyze_freqtrade_data(df_5m: pd.DataFrame, current_price: float) -> str:
             df_tf.ta.macd(append=True)
             df_tf.ta.bbands(length=20, append=True)
             df_tf.ta.obv(append=True)
-            
-            # --- Extract Last 5 Candles for History & Delta ---
             last_five = df_tf.iloc[-5:]
-            if len(last_five) < 2: continue # Need at least 2 candles for delta
-            
+            if len(last_five) < 2: continue
             latest = last_five.iloc[-1]
             previous = last_five.iloc[-2]
-
-            # --- Trend Analysis ---
             trend = "BULLISH" if latest.get('EMA_20', 0) > latest.get('EMA_50', 0) else "BEARISH" if latest.get('EMA_20', 0) < latest.get('EMA_50', 0) else "RANGING"
-
-            # --- Hybrid Data Extraction (Value, Delta, History) ---
-            # RSI
             rsi_delta = latest.get('RSI_14', 0) - previous.get('RSI_14', 0)
             rsi_history = last_five['RSI_14'].round(2).tolist()
-            # MACD Histogram
             macd_hist_delta = latest.get('MACDh_12_26_9', 0) - previous.get('MACDh_12_26_9', 0)
             macd_hist_history = last_five['MACDh_12_26_9'].round(4).tolist()
-            # OBV (On-Balance Volume)
             obv_ema = ta.ema(df_tf['OBV'], length=10)
             obv_ema_history = obv_ema.iloc[-5:].round(0).tolist() if not obv_ema.empty else []
-
-            # --- Bollinger Bands Analysis ---
             bb_pos = "Above Upper Band" if latest['close'] > latest.get('BBU_20_2.0', 0) else "Below Lower Band" if latest['close'] < latest.get('BBL_20_2.0', 0) else "Between Bands"
-
-            # --- Format the Report String ---
             analysis_report += f"--- Report ({tf_name}) ---\n"
             analysis_report += f"Close: {latest['close']:.4f}, Trend: {trend}\n"
             analysis_report += f"RSI: {latest.get('RSI_14', 50):.2f} (Δ: {rsi_delta:+.2f}) | History: {rsi_history}\n"
             analysis_report += f"MACD Hist: {latest.get('MACDh_12_26_9', 0):.4f} (Δ: {macd_hist_delta:+.4f}) | History: {macd_hist_history}\n"
             analysis_report += f"ADX: {latest.get('ADX_14', 0):.2f}, BBands: {bb_pos}\n"
             analysis_report += f"OBV EMA(10) History: {obv_ema_history}\n"
-
         except Exception as e:
             analysis_report += f"--- Report ({tf_name}) ---\nError during analysis: {e}\n"
-            
     return analysis_report
 
-def get_ai_decision_sync(analysis_data: str, position_data: str, context_summary: str, live_equity: float, sentiment_score: float) -> Tuple[Dict, Dict, str]:
-    """Synchronously retrieves decision, context, and raw response from the AI."""
+# ########################################################################### #
+# ################## START OF MODIFIED SECTION ############################## #
+# ########################################################################### #
+def get_market_regime(df_1d: pd.DataFrame) -> str:
+    """Determines the overall market regime based on long-term indicators."""
+    if len(df_1d) < 200:
+        return "UNCLEAR (Insufficient 1D data)"
+    try:
+        ema_200 = ta.ema(df_1d['close'], length=200).iloc[-1]
+        latest_close = df_1d['close'].iloc[-1]
+        bbands = ta.bbands(df_1d['close'], length=20)
+        bb_width_pct = ((bbands['BBU_20_2.0'] - bbands['BBL_20_2.0']) / bbands['BBM_20_2.0'] * 100).iloc[-1]
+        regime = ""
+        if latest_close > ema_200:
+            regime = "BULLISH TREND"
+        else:
+            regime = "BEARISH TREND"
+        if bb_width_pct < 15:
+            regime = "RANGING / CONSOLIDATION"
+        return regime
+    except Exception as e:
+        print(f"⚠️ Error calculating market regime: {e}")
+        return "UNCLEAR (Calculation Error)"
+# ########################################################################### #
+# ################### END OF MODIFIED SECTION ############################### #
+# ########################################################################### #
+
+def get_ai_decision_sync(analysis_data: str, position_data: str, context_summary: str, live_equity: float, sentiment_score: float, market_regime: str) -> Tuple[Dict, Dict, str, str]:
+    """Synchronously retrieves decision, context, raw response, and thoughts from the AI."""
     global AI_CLIENT
-    if not AI_CLIENT: return {}, {}, ""
+    if not AI_CLIENT: return {}, {}, "", ""
     try:
         with open("trade_memory.txt", "r") as f: lessons = "".join(f.readlines()[-15:])
     except FileNotFoundError: lessons = "No past trade lessons available yet."
     
-    prompt_body = f"""**--- CRITICAL ACCOUNT CONSTRAINTS ---**
-My current account equity is ${live_equity:.2f} USDT. Leverage limit is 50x.
+    prompt_body = f"""**--- OVERALL MARKET REGIME ---**
+The current macro market condition is determined to be: **{market_regime}**
+
+**--- CRITICAL ACCOUNT CONSTRAINTS ---**
+My current account equity is ${live_equity:.2f} USDT.
+
 **--- NEWS SENTIMENT ---**
 Current News Sentiment Score: {sentiment_score:.2f} (-1 Negative, +1 Positive).
+
 **--- STRATEGIC MEMORY: LESSONS FROM PAST TRADES ---**
 {lessons}
-**--- YOUR LAST MARKET CONTEXT ---**
+
+**--- HISTORY OF YOUR RECENT MARKET ANALYSES ---**
 {context_summary}
+
 **--- CURRENT DATA FOR ANALYSIS ---**
 1. Current Position Status: {position_data}
-2. Freqtrade Market Analysis:\n{analysis_data}"""
+2. Multi-Timeframe Hybrid Technical Analysis:\n{analysis_data}"""
     
     try:
         response = AI_CLIENT.chat.completions.create(
@@ -307,10 +294,10 @@ Current News Sentiment Score: {sentiment_score:.2f} (-1 Negative, +1 Positive).
         decision_dict = parse_decision_block(raw_response_text)
         context_dict = parse_context_block(raw_response_text)
         chain_of_thought = parse_chain_of_thought_block(raw_response_text)
-        return decision_dict, context_dict, raw_response_text, chain_of_thought # <--- RETURN THE THOUGHTS
+        return decision_dict, context_dict, raw_response_text, chain_of_thought
     except Exception:
         print(f"❌ Unexpected Error in AI call: {traceback.format_exc()}")
-        return {}, {}, ""
+        return {}, {}, "", ""
 
 def summarize_and_learn_sync(trade_summary: str, symbol: str):
     global AI_CLIENT
