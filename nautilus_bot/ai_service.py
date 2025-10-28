@@ -75,6 +75,7 @@ class AIService:
         position_text: str,
         context_summary: str,
         live_equity: float,
+        available_margin: float,
         active_triggers: Optional[List[Dict[str, Any]]] = None,
         trigger_reason: str = "",
     ) -> DecisionPayload:
@@ -101,6 +102,7 @@ class AIService:
             sentiment=sentiment,
             market_regime=market_regime,
             live_equity=live_equity,
+            available_margin=available_margin,
             lessons=lessons,
             active_triggers=active_triggers,
             trigger_reason=trigger_reason,
@@ -395,6 +397,7 @@ class AIService:
         sentiment: float,
         market_regime: str,
         live_equity: float,
+        available_margin: float,
         lessons: str,
         active_triggers: List[Dict[str, Any]],
         trigger_reason: str,
@@ -406,6 +409,7 @@ class AIService:
         return (
             f"**市场环境**：{market_regime}\n"
             f"**账户权益**：${live_equity:.2f}\n"
+            f"**可用保证金**：${available_margin:.2f}\n"
             f"**情绪分数**：{sentiment:+.2f}\n"
             "**风险护栏**：\n"
             "- 如“风险警示”段落出现超买/超卖提示，必须以 WAIT 为首选，并说明等待条件；除非当前已持有与提示方向一致的仓位。\n"

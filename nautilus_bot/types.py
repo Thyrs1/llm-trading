@@ -103,3 +103,6 @@ class TradeLifecycle:
     market_regime: Optional[str] = None
     news_digest: str = ""
     fills: List[Dict[str, Any]] = field(default_factory=list)
+    leverage: float = 1.0
+    risk_fraction: float = 0.0
+    notional: float = 0.0

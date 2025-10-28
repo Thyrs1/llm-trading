@@ -302,6 +302,8 @@ class TradingOrchestrator:
                     trade_size=self.settings.strategy.trade_size,
                     order_id_tag=self.settings.strategy.order_id_tag,
                     analysis_cooldown_secs=self.settings.strategy.analysis_cooldown_secs,
+                    default_leverage=self.settings.strategy.default_leverage,
+                    max_leverage=self.settings.strategy.max_leverage,
                 )
             ]
         used_tags: set[str] = set()
@@ -332,6 +334,8 @@ class TradingOrchestrator:
                 bar_history=target.bar_history,
                 analysis_cooldown_secs=target.analysis_cooldown_secs,
                 order_id_tag=target.order_id_tag,
+                default_leverage=target.default_leverage,
+                max_leverage=target.max_leverage,
             )
             strategy = LLMStrategy(
                 config=strategy_config,
@@ -580,6 +584,8 @@ class TradingOrchestrator:
                 "bar_history": target.bar_history,
                 "analysis_cooldown_secs": target.analysis_cooldown_secs,
                 "order_id_tag": target.order_id_tag,
+                "default_leverage": target.default_leverage,
+                "max_leverage": target.max_leverage,
             }
             importable_configs.append(
                 ImportableStrategyConfig(
@@ -615,11 +621,11 @@ class TradingOrchestrator:
         )
 
         venue_config = BacktestVenueConfig(
-            name="BINANCE",
-            oms_type="HEDGING",
-            account_type="MARGIN",
-            starting_balances=["100000 USDT"],
-            base_currency="USDT",
+            name=self.settings.backtest.venue_name,
+            oms_type=self.settings.backtest.oms_type,
+            account_type=self.settings.backtest.account_type,
+            starting_balances=self.settings.backtest.starting_balances,
+            base_currency=self.settings.backtest.base_currency,
         )
 
         if not self.settings.backtest.start or not self.settings.backtest.end:

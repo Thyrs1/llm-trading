@@ -32,6 +32,8 @@ min_history = 120
 trade_size = 0.01
 order_id_tag = "LLM"
 analysis_cooldown_secs = 300
+default_leverage = 10.0
+max_leverage = 50.0
 
 [telemetry]
 database_path = "trading_data.db"
@@ -41,3 +43,8 @@ catalog_path = "./data/catalog"
 start = "2024-01-01T00:00:00Z"
 end = "2024-01-31T00:00:00Z"
 trader_id = "LLM-001"
+venue_name = "BINANCE"
+oms_type = "HEDGING"
+account_type = "MARGIN"
+base_currency = "USDT"
+starting_balances = ["100000 USDT"]

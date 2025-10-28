@@ -52,8 +52,8 @@ python main.py --mode live       # 连接 Binance 与 AI 服务（需有效密�
 ## 配置要点
 - `binance.*`：填写现货/合约 API Key、Secret、Base URL 及保证金模式。
 - `ai.*`：配置 LLM 调用信息（如 Base URL、模型名称、情绪分析开关等）。
-- `strategy.*`：指定交易合约（例如 `BTCUSDT-PERP.BINANCE`）、时间框架与分析冷却时间。
-- `backtest.*`：设置回测时间区间与 catalog 路径，建议与实盘参数保持一致。
+- `strategy.*`：指定交易合约（例如 `BTCUSDT-PERP.BINANCE`）、时间框架、分析冷却时间，并通过 `trade_size`、`default_leverage`（默认 10x）、`max_leverage`（默认 50x）约束默认下单规模与杠杆上限。
+- `backtest.*`：设置回测时间区间、catalog 路径，以及 `starting_balances`、`account_type`、`base_currency` 等账户参数，建议与实盘保持一致。
 
 ## 运行模式
 | 模式 | 命令 | 说明 |

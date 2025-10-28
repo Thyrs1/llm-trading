@@ -75,6 +75,8 @@ class InstrumentSettings:
     trade_size: float = 0.01
     order_id_tag: str = "LLM"
     analysis_cooldown_secs: int = 300
+    default_leverage: float = 10.0
+    max_leverage: float = 50.0
 
 
 @dataclass(slots=True)
@@ -90,6 +92,8 @@ class StrategySettings:
     trade_size: float = 0.01
     order_id_tag: str = "LLM"
     analysis_cooldown_secs: int = 300
+    default_leverage: float = 10.0
+    max_leverage: float = 50.0
     instruments: List[InstrumentSettings] = field(default_factory=list)
 
 
@@ -108,6 +112,11 @@ class BacktestSettings:
     start: Optional[str] = None
     end: Optional[str] = None
     trader_id: str = "LLM-001"
+    venue_name: str = "BINANCE"
+    oms_type: str = "HEDGING"
+    account_type: str = "MARGIN"
+    base_currency: str = "USDT"
+    starting_balances: List[str] = field(default_factory=lambda: ["100000 USDT"])
 
 
 @dataclass(slots=True)
@@ -219,6 +228,14 @@ def _apply_file_overrides(settings: BotSettings, data: Dict[str, Any]) -> None:
         "analysis_cooldown_secs",
         settings.strategy.analysis_cooldown_secs,
     )
+    settings.strategy.default_leverage = strat_cfg.get(
+        "default_leverage",
+        settings.strategy.default_leverage,
+    )
+    settings.strategy.max_leverage = strat_cfg.get(
+        "max_leverage",
+        settings.strategy.max_leverage,
+    )
     settings.strategy.binance_symbol = strat_cfg.get("binance_symbol", settings.strategy.binance_symbol)
     settings.strategy.binance_interval = strat_cfg.get("binance_interval", settings.strategy.binance_interval)
 
@@ -232,6 +249,8 @@ def _apply_file_overrides(settings: BotSettings, data: Dict[str, Any]) -> None:
         trade_size=settings.strategy.trade_size,
         order_id_tag=settings.strategy.order_id_tag,
         analysis_cooldown_secs=settings.strategy.analysis_cooldown_secs,
+        default_leverage=settings.strategy.default_leverage,
+        max_leverage=settings.strategy.max_leverage,
     )
     instruments_cfg = strat_cfg.get("instruments")
     if isinstance(instruments_cfg, list) and instruments_cfg:
@@ -251,6 +270,13 @@ def _apply_file_overrides(settings: BotSettings, data: Dict[str, Any]) -> None:
     settings.backtest.start = backtest_cfg.get("start", settings.backtest.start)
     settings.backtest.end = backtest_cfg.get("end", settings.backtest.end)
     settings.backtest.trader_id = backtest_cfg.get("trader_id", settings.backtest.trader_id)
+    settings.backtest.venue_name = backtest_cfg.get("venue_name", settings.backtest.venue_name)
+    settings.backtest.oms_type = backtest_cfg.get("oms_type", settings.backtest.oms_type)
+    settings.backtest.account_type = backtest_cfg.get("account_type", settings.backtest.account_type)
+    settings.backtest.base_currency = backtest_cfg.get("base_currency", settings.backtest.base_currency)
+    starting_balances_cfg = backtest_cfg.get("starting_balances")
+    if isinstance(starting_balances_cfg, list) and starting_balances_cfg:
+        settings.backtest.starting_balances = [str(item) for item in starting_balances_cfg]
 
 
 def _instrument_from_dict(data: Dict[str, Any], defaults: InstrumentSettings) -> InstrumentSettings:
@@ -266,6 +292,8 @@ def _instrument_from_dict(data: Dict[str, Any], defaults: InstrumentSettings) ->
         analysis_cooldown_secs=int(
             data.get("analysis_cooldown_secs", defaults.analysis_cooldown_secs)
         ),
+        default_leverage=float(data.get("default_leverage", defaults.default_leverage)),
+        max_leverage=float(data.get("max_leverage", defaults.max_leverage)),
     )
 
 
@@ -331,6 +359,12 @@ def _apply_env_overrides(settings: BotSettings) -> None:
     binance_interval = env.get("BOT_STRATEGY_BINANCE_INTERVAL")
     if binance_interval:
         settings.strategy.binance_interval = binance_interval
+    default_leverage = env.get("BOT_STRATEGY_DEFAULT_LEVERAGE")
+    if default_leverage:
+        settings.strategy.default_leverage = float(default_leverage)
+    max_leverage = env.get("BOT_STRATEGY_MAX_LEVERAGE")
+    if max_leverage:
+        settings.strategy.max_leverage = float(max_leverage)
 
     db_path = env.get("BOT_DB_PATH")
     if db_path:
@@ -348,3 +382,20 @@ def _apply_env_overrides(settings: BotSettings) -> None:
     trader_id = env.get("BOT_BACKTEST_TRADER_ID")
     if trader_id:
         settings.backtest.trader_id = trader_id
+    venue_name = env.get("BOT_BACKTEST_VENUE_NAME")
+    if venue_name:
+        settings.backtest.venue_name = venue_name
+    oms_type = env.get("BOT_BACKTEST_OMS_TYPE")
+    if oms_type:
+        settings.backtest.oms_type = oms_type
+    account_type = env.get("BOT_BACKTEST_ACCOUNT_TYPE")
+    if account_type:
+        settings.backtest.account_type = account_type
+    base_currency = env.get("BOT_BACKTEST_BASE_CURRENCY")
+    if base_currency:
+        settings.backtest.base_currency = base_currency
+    balances_raw = env.get("BOT_BACKTEST_STARTING_BALANCES")
+    if balances_raw:
+        settings.backtest.starting_balances = [
+            balance.strip() for balance in balances_raw.split(",") if balance.strip()
+        ]

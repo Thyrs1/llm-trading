@@ -136,6 +136,8 @@ class LLMStrategyConfig(StrategyConfig, Struct, kw_only=True, frozen=True):
     bar_history: int = 720
     analysis_cooldown_secs: int = 300
     order_id_tag: str = "LLM"
+    default_leverage: float = 1.0
+    max_leverage: float = 3.0
 
 
 class LLMStrategy(Strategy):
@@ -168,12 +170,17 @@ class LLMStrategy(Strategy):
         self._trigger_manager = TriggerManager(symbol=str(self._instrument_id))
         self._last_analysis_ts: float = 0.0
         self._trade_size = Decimal(str(config.trade_size))
+        self._default_leverage = max(1.0, float(config.default_leverage))
+        self._max_leverage = max(self._default_leverage, float(config.max_leverage))
         self._trade = TradeLifecycle(symbol=str(self._instrument_id))
         self._latest_context: Dict[str, Any] = {}
         self._pending_trigger_reason: str = ""
         self._last_price: float = 0.0
         self._instrument_ready: bool = False
         self._bars_subscribed: bool = False
+        self._last_effective_leverage: float = self._default_leverage
+        self._last_risk_fraction: float = self.risk.settings.max_risk_per_trade
+        self._last_target_notional: float = 0.0
 
     # ------------------------------------------------------------------ #
     # Nautilus 生命周期钩子
@@ -274,6 +281,7 @@ class LLMStrategy(Strategy):
             position_text=position_text,
             context_summary=context_summary,
             live_equity=vitals.get("total_equity", 0.0),
+            available_margin=vitals.get("available_margin", 0.0),
             active_triggers=active_triggers,
             trigger_reason=self._pending_trigger_reason,
         )
@@ -330,7 +338,13 @@ class LLMStrategy(Strategy):
         order_side = OrderSide.BUY if side == "LONG" else OrderSide.SELL
 
         try:
-            quantity = self._resolve_order_quantity()
+            price_hint = decision.entry_price or self._last_price or 0.0
+            quantity = self._resolve_order_quantity(
+                price=price_hint,
+                equity=equity,
+                available_margin=account_vitals.get("available_margin", equity),
+                decision=decision,
+            )
         except Exception as exc:
             self.telemetry.log(f"❌ 构造交易数量失败：{exc}", str(self._instrument_id))
             return
@@ -363,19 +377,67 @@ class LLMStrategy(Strategy):
         self._trade.sentiment = payload.sentiment
         self._trade.market_regime = payload.market_regime
         self._trade.news_digest = payload.news_digest
+        self._trade.leverage = self._last_effective_leverage
+        self._trade.risk_fraction = self._last_risk_fraction
+        self._trade.notional = self._last_target_notional
         if decision.entry_price is not None:
             self._trade.entry_price = decision.entry_price
         self._trade.entry_order_id = order_id
         self.telemetry.log(
-            f"✅ 已提交 {side} 市价单，数量 {self._quantity_as_float(quantity):.6f}",
+            (
+                f"✅ 已提交 {side} 市价单，数量 {self._quantity_as_float(quantity):.6f}，"
+                f"杠杆 {self._last_effective_leverage:.2f}x，名义≈{self._last_target_notional:.2f} USDT"
+            ),
             str(self._instrument_id),
         )
         self._update_triggers(decision)
 
-    def _resolve_order_quantity(self) -> Quantity:
+    def _resolve_order_quantity(
+        self,
+        price: float,
+        equity: float,
+        available_margin: float,
+        decision: AIDecision,
+    ) -> Quantity:
         """
-        根据合约精度生成下单数量，失败时回退到通用数量解析。
+        根据风险预算、杠杆与合约精度生成下单数量。
         """
+
+        effective_price = max(price, 0.0)
+        risk_cap = max(self.risk.settings.max_risk_per_trade, 0.0)
+        decision_risk = decision.risk_percent
+        if decision_risk is not None and decision_risk > 0:
+            normalized = decision_risk / 100.0 if decision_risk > 1 else decision_risk
+            risk_cap = min(risk_cap, max(normalized, 0.0))
+        risk_cap = min(risk_cap, 1.0)
+
+        margin_budget = equity * risk_cap
+        if available_margin > 0:
+            margin_budget = min(margin_budget, available_margin)
+        margin_budget = max(margin_budget, 0.0)
+
+        desired_leverage = decision.leverage or self._default_leverage
+        if desired_leverage is None or desired_leverage <= 0:
+            desired_leverage = self._default_leverage
+        effective_leverage = min(self._max_leverage, max(float(desired_leverage), 1.0))
+
+        target_qty = 0.0
+        if effective_price > 0 and margin_budget > 0:
+            notional = margin_budget * effective_leverage
+            target_qty = notional / effective_price
+
+        if target_qty <= 0:
+            target_qty = float(self._trade_size)
+
+        if effective_price > 0 and effective_leverage > 0 and available_margin > 0:
+            required_margin = (target_qty * effective_price) / effective_leverage
+            if required_margin > available_margin and required_margin > 0:
+                scale = available_margin / required_margin
+                target_qty *= max(scale, 0.0)
+
+        self._last_risk_fraction = risk_cap
+        self._last_effective_leverage = effective_leverage
+        self._last_target_notional = target_qty * effective_price if effective_price > 0 else 0.0
 
         instrument: Optional[Instrument] = None
         try:
@@ -385,8 +447,8 @@ class LLMStrategy(Strategy):
 
         if instrument is not None:
             try:
-                quantity = instrument.make_qty(float(self._trade_size))  # type: ignore[attr-defined]
-                if quantity is not None:
+                quantity = instrument.make_qty(float(target_qty))  # type: ignore[attr-defined]
+                if quantity is not None and self._quantity_as_float(quantity) > 0:
                     return quantity
             except Exception as exc:
                 self.telemetry.log(
@@ -394,7 +456,7 @@ class LLMStrategy(Strategy):
                     str(self._instrument_id),
                 )
 
-        normalized = self._trade_size.normalize()
+        normalized = Decimal(str(max(target_qty, float(self._trade_size)))).normalize()
         size_str = format(normalized, "f")
         try:
             return Quantity.from_str(size_str)  # type: ignore[attr-defined]
@@ -407,7 +469,8 @@ class LLMStrategy(Strategy):
             return
 
         try:
-            self.close_position(self._instrument_id)  # type: ignore[attr-defined]
+            # 使用 close_all_positions 支持通过 InstrumentId 直接平掉该品种的所有仓位
+            self.close_all_positions(instrument_id=self._instrument_id)  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001
             self.telemetry.log(f"❌ 平仓指令失败：{exc}", str(self._instrument_id))
             return
@@ -805,6 +868,12 @@ class LLMStrategy(Strategy):
             parts.append(
                 f"平仓 {trade.exit_price:.6f} @ {trade.exit_time.strftime('%Y-%m-%d %H:%M:%S')}",
             )
+        if trade.leverage:
+            parts.append(f"杠杆 {trade.leverage:.2f}x")
+        if trade.risk_fraction:
+            parts.append(f"风险占用 {trade.risk_fraction * 100:.2f}%")
+        if trade.notional:
+            parts.append(f"名义 {trade.notional:.2f}")
         parts.append(f"PnL {pnl:.4f} ({pnl_pct:.2f}%)")
         if trade.trigger_reason:
             parts.append(f"触发：{trade.trigger_reason}")
