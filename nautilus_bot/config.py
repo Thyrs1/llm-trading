@@ -18,7 +18,7 @@ class BinanceClientSettings:
 
     api_key: str = ""
     api_secret: str = ""
-    account_type: str = "usdt_future"
+    account_type: str = "USDT_FUTURES"
     base_http_url: Optional[str] = None
     base_ws_url: Optional[str] = None
     is_us: bool = False
