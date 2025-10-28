@@ -1,0 +1,43 @@
+[binance]
+api_key = "YOUR_BINANCE_KEY"
+api_secret = "YOUR_BINANCE_SECRET"
+account_type = "usdt_future"  # {spot, margin, usdt_future, coin_future}
+base_http_url = ""
+base_ws_url = ""
+is_us = false
+
+[ai]
+base_url = "https://api.deepseek.com/v1"
+api_key = "YOUR_DEEPSEEK_KEY"
+model = "deepseek-chat"
+enable_sentiment = true
+rss_feeds = [
+  "https://cointelegraph.com/rss",
+  "https://www.coindesk.com/arc/outboundfeeds/rss/"
+]
+
+[risk]
+max_risk_per_trade = 0.02
+max_daily_drawdown_pct = 5.0
+max_consecutive_losses = 3
+trading_pause_seconds = 3600
+
+[strategy]
+instrument_id = "BTCUSDT-PERP.BINANCE"
+bar_type = "BTCUSDT-PERP.BINANCE-5-MINUTE-LAST-EXTERNAL"
+binance_symbol = "BTCUSDT"
+binance_interval = "5m"
+bar_history = 720
+min_history = 120
+trade_size = 0.01
+order_id_tag = "LLM"
+analysis_cooldown_secs = 300
+
+[telemetry]
+database_path = "trading_data.db"
+
+[backtest]
+catalog_path = "./data/catalog"
+start = "2024-01-01T00:00:00Z"
+end = "2024-01-31T00:00:00Z"
+trader_id = "LLM-001"

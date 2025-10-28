@@ -1,13 +1,18 @@
 # Ignore config files containing sensitive information and runtime files
-config.py
 status.json
 run.sh
 run.bat
 hist_data_*
 market_context*.json
 report*
+reports/
+data/catalog/
+.serena/
+trade_memory.txt
+dashboard_snapshot.json
 *.csv
 *.db
+config.toml
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
