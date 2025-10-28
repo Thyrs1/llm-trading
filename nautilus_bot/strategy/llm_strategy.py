@@ -226,11 +226,16 @@ class LLMStrategy(Strategy):
             self.telemetry.log(f"📊 触发分析原因：{reason_text}", str(self._instrument_id))
         self._last_analysis_ts = now_ts
 
+        active_triggers = [self._serialize_trigger(trigger) for trigger in self._trigger_manager.triggers]
         snapshot = MarketSnapshot(
             instrument_id=str(self._instrument_id),
             timeframe=self.config.bar_type,
             current_price=float(getattr(bar, "close", 0.0)),
             ohlcv=self._history_df.copy(),
+            metadata={
+                "active_triggers": active_triggers,
+                "pending_trigger_reason": self._pending_trigger_reason,
+            },
         )
         position_text = self._describe_position()
         context_summary = "\n".join(self._context_history) or "无历史上下文。"
@@ -241,6 +246,8 @@ class LLMStrategy(Strategy):
             position_text=position_text,
             context_summary=context_summary,
             live_equity=vitals.get("total_equity", 0.0),
+            active_triggers=active_triggers,
+            trigger_reason=self._pending_trigger_reason,
         )
 
         self._handle_decision(payload, vitals)

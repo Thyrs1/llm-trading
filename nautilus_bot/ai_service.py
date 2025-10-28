@@ -75,6 +75,8 @@ class AIService:
         position_text: str,
         context_summary: str,
         live_equity: float,
+        active_triggers: Optional[List[Dict[str, Any]]] = None,
+        trigger_reason: str = "",
     ) -> DecisionPayload:
         """
         基于最新行情快照请求 AI 做出交易决策。
@@ -87,6 +89,8 @@ class AIService:
         news_digest = self._collect_news(snapshot.instrument_id)
         sentiment = self._compute_sentiment(news_digest)
         market_regime = self._determine_market_regime(snapshot.ohlcv)
+        active_triggers = active_triggers or snapshot.metadata.get("active_triggers", [])
+        trigger_reason = trigger_reason or snapshot.metadata.get("pending_trigger_reason", "")
 
         lessons = self._load_lessons()
         prompt_body = self._compose_prompt(
@@ -98,6 +102,8 @@ class AIService:
             market_regime=market_regime,
             live_equity=live_equity,
             lessons=lessons,
+            active_triggers=active_triggers,
+            trigger_reason=trigger_reason,
         )
 
         response = self._client.chat.completions.create(
@@ -254,7 +260,7 @@ class AIService:
 
         report = [f"### 当前价格\n- **最新成交价：** {current_price:.4f} USDT\n"]
         risk_flags: List[str] = []
-        tf_settings = {"1d": "1d", "4h": "4h", "1h": "1h", "15m": "15min"}
+        tf_settings = {"4h": "4h", "1h": "1h", "15m": "15min", "5m": "5min"}
 
         for label, rule in tf_settings.items():
             resampled = df_clean.resample(rule).agg(
@@ -390,8 +396,12 @@ class AIService:
         market_regime: str,
         live_equity: float,
         lessons: str,
+        active_triggers: List[Dict[str, Any]],
+        trigger_reason: str,
     ) -> str:
         """拼装交给 LLM 的主体提示词。"""
+
+        trigger_plan = self._format_triggers(active_triggers, trigger_reason)
 
         return (
             f"**市场环境**：{market_regime}\n"
@@ -404,9 +414,31 @@ class AIService:
             f"**记忆库**：\n{lessons}\n\n"
             f"**历史上下文**：\n{context_summary}\n\n"
             f"**当前仓位**：{position_text}\n\n"
+            f"**触发器计划**：\n{trigger_plan}\n\n"
             f"**技术分析**：\n{analysis_text}\n\n"
             f"**新闻摘要**：{news_digest}\n"
         )
+
+    @staticmethod
+    def _format_triggers(triggers: List[Dict[str, Any]], reason: str) -> str:
+        if not triggers:
+            base = "当前无活跃触发器，请在需要时新建。"
+        else:
+            lines = []
+            for idx, trig in enumerate(triggers, start=1):
+                label = trig.get("label") or f"Trigger-{idx}"
+                t_type = trig.get("type", "UNKNOWN")
+                detail_parts = []
+                for key, value in trig.items():
+                    if key in {"label", "type"}:
+                        continue
+                    detail_parts.append(f"{key}={value}")
+                details = ", ".join(detail_parts) if detail_parts else "无附加参数"
+                lines.append(f"- {label} | 类型={t_type} | {details}")
+            base = "\n".join(lines)
+        if reason:
+            return base + f"\n- 最近触发原因：{reason}"
+        return base
 
     def _load_lessons(self) -> str:
         if not self._memory_file.exists():
