@@ -29,7 +29,7 @@ class BinanceClientSettings:
 class InstrumentProviderSettings:
     """行情合约加载配置。"""
 
-    load_all: bool = False
+    load_all: bool = True
     load_ids: List[str] = field(default_factory=list)
     filters: Dict[str, Any] = field(default_factory=dict)
     filter_callable: Optional[str] = None

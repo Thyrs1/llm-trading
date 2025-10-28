@@ -94,8 +94,8 @@ class TradingOrchestrator:
         asyncio.run(self._run_live_async())
 
     async def _run_live_async(self) -> None:
-        node = self._build_trading_node()
-        self._register_strategy(node)
+        node = await self._build_trading_node()
+        await self._register_strategy(node)
 
         vitals_task = asyncio.create_task(self._poll_account_vitals(node))
         self.telemetry.log("🚀 Nautilus TradingNode 已就绪，开始运行。")
@@ -107,7 +107,7 @@ class TradingOrchestrator:
                 await vitals_task
             self.telemetry.log("🛑 TradingNode 已停止。")
 
-    def _build_trading_node(self) -> TradingNode:
+    async def _build_trading_node(self) -> TradingNode:
         assert TradingNode is not None and TradingNodeConfig is not None
         assert BinanceLiveDataClientFactory is not None and BinanceLiveExecClientFactory is not None
         assert BinanceDataClientConfig is not None and BinanceExecClientConfig is not None
@@ -148,14 +148,14 @@ class TradingOrchestrator:
         node.add_data_client_factory(BINANCE, BinanceLiveDataClientFactory)
         node.add_exec_client_factory(BINANCE, BinanceLiveExecClientFactory)
         node.build()
-        self._warm_cache_with_targets(node, targets)
+        await self._warm_cache_with_targets(node, targets)
         return node
 
     def _build_instrument_provider(self, strategy_ids: set[Any]) -> "InstrumentProviderConfig":
         assert InstrumentProviderConfig is not None  # for type checkers
         provider_settings = self.settings.binance.instrument_provider
 
-        load_all = provider_settings.load_all
+        load_all = True
         filters = provider_settings.filters or None
         filter_callable = provider_settings.filter_callable or None
         log_warnings = provider_settings.log_warnings
@@ -177,7 +177,7 @@ class TradingOrchestrator:
 
         if load_all:
             return InstrumentProviderConfig(
-                load_all=True,
+                load_all=True, # hardcode this shit
                 load_ids=frozenset(load_ids) if load_ids else None,
                 filters=filters,
                 filter_callable=filter_callable,
@@ -185,7 +185,7 @@ class TradingOrchestrator:
             )
 
         return InstrumentProviderConfig(
-            load_all=False,
+            load_all=True, # hardcode this shit
             load_ids=frozenset(load_ids) if load_ids else None,
             filters=filters,
             filter_callable=filter_callable,
@@ -213,7 +213,7 @@ class TradingOrchestrator:
             raise ValueError(f"不支持的 Binance 账户类型：{value}")
         return BinanceAccountType[key]
 
-    def _fetch_instrument_metadata(self, instrument_id: str) -> Optional["Instrument"]:
+    async def _fetch_instrument_metadata(self, instrument_id: str) -> Optional["Instrument"]:
         if (
             BinanceFuturesInstrumentProvider is None
             or BinanceHttpClient is None
@@ -239,14 +239,14 @@ class TradingOrchestrator:
                 venue=Venue(str(BINANCE)),
             )
             inst_id = InstrumentId.from_str(instrument_id)
-            provider.load_ids([inst_id])
+            await provider.load_async(inst_id)
             instrument = provider.find(inst_id)
             return instrument
         except Exception as exc:  # pragma: no cover - 网络或权限问题
             self.telemetry.log(f"⚠️ 合约元数据加载失败：{exc}", instrument_id)
             return None
 
-    def _warm_cache_with_targets(self, node: TradingNode, targets: List[InstrumentSettings]) -> None:
+    async def _warm_cache_with_targets(self, node: TradingNode, targets: List[InstrumentSettings]) -> None:
         if Instrument is None:
             return
         seen: set[str] = set()
@@ -255,7 +255,7 @@ class TradingOrchestrator:
             if instrument_id in seen:
                 continue
             seen.add(instrument_id)
-            instrument = self._fetch_instrument_metadata(instrument_id)
+            instrument = await self._fetch_instrument_metadata(instrument_id)
             if instrument is None:
                 continue
             if hasattr(node, "cache"):
@@ -269,10 +269,10 @@ class TradingOrchestrator:
                 except Exception:
                     pass
 
-    def _preload_instrument(self, node: TradingNode, target: InstrumentSettings) -> None:
+    async def _preload_instrument(self, node: TradingNode, target: InstrumentSettings) -> None:
         if not hasattr(node, "trader") or Instrument is None:
             return
-        instrument = self._fetch_instrument_metadata(target.instrument_id)
+        instrument = await self._fetch_instrument_metadata(target.instrument_id)
         if instrument is None:
             return
         try:
@@ -334,11 +334,11 @@ class TradingOrchestrator:
                 continue
         return 0.0
 
-    def _register_strategy(self, node: TradingNode) -> None:
+    async def _register_strategy(self, node: TradingNode) -> None:
         trader = node.trader
         initial_balance = self._initial_balance_hint()
         for target in self._strategy_targets():
-            self._preload_instrument(node, target)
+            await self._preload_instrument(node, target)
             strategy_config = LLMStrategyConfig(
                 instrument_id=target.instrument_id,
                 bar_type=target.bar_type,

@@ -90,11 +90,8 @@ def _list_by_provider(settings: BotSettings, account_type: BinanceAccountType) -
         venue=Venue(str(BINANCE)),
     )
 
-    provider.load_all()
-    cache = getattr(provider, "cache", None)
-    if cache is None:
-        raise RuntimeError("InstrumentProvider cache 未提供缓存")
-    for instrument in cache.instruments():
+    provider.list_all()
+    for instrument in provider.list_all():
         yield str(instrument.id)
 
 
