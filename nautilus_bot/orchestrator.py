@@ -322,8 +322,21 @@ class TradingOrchestrator:
         self._strategy_targets_cache = normalized
         return normalized
 
+    def _initial_balance_hint(self) -> float:
+        balances = getattr(self.settings.backtest, "starting_balances", []) or []
+        for entry in balances:
+            if not entry:
+                continue
+            token = entry.replace(",", " ").split()[0]
+            try:
+                return float(token)
+            except ValueError:
+                continue
+        return 0.0
+
     def _register_strategy(self, node: TradingNode) -> None:
         trader = node.trader
+        initial_balance = self._initial_balance_hint()
         for target in self._strategy_targets():
             self._preload_instrument(node, target)
             strategy_config = LLMStrategyConfig(
@@ -336,6 +349,8 @@ class TradingOrchestrator:
                 order_id_tag=target.order_id_tag,
                 default_leverage=target.default_leverage,
                 max_leverage=target.max_leverage,
+                initial_equity=initial_balance,
+                initial_available_margin=initial_balance,
             )
             strategy = LLMStrategy(
                 config=strategy_config,
@@ -575,6 +590,7 @@ class TradingOrchestrator:
         importable_configs: List[ImportableStrategyConfig] = []
         data_configs: List[BacktestDataConfig] = []
 
+        initial_balance = self._initial_balance_hint()
         for target in self._strategy_targets():
             strategy_dict = {
                 "instrument_id": target.instrument_id,
@@ -586,6 +602,8 @@ class TradingOrchestrator:
                 "order_id_tag": target.order_id_tag,
                 "default_leverage": target.default_leverage,
                 "max_leverage": target.max_leverage,
+                "initial_equity": initial_balance,
+                "initial_available_margin": initial_balance,
             }
             importable_configs.append(
                 ImportableStrategyConfig(

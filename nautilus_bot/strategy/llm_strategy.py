@@ -136,8 +136,10 @@ class LLMStrategyConfig(StrategyConfig, Struct, kw_only=True, frozen=True):
     bar_history: int = 720
     analysis_cooldown_secs: int = 300
     order_id_tag: str = "LLM"
-    default_leverage: float = 1.0
-    max_leverage: float = 3.0
+    default_leverage: float = 10.0
+    max_leverage: float = 50.0
+    initial_equity: float = 0.0
+    initial_available_margin: float = 0.0
 
 
 class LLMStrategy(Strategy):
@@ -172,6 +174,8 @@ class LLMStrategy(Strategy):
         self._trade_size = Decimal(str(config.trade_size))
         self._default_leverage = max(1.0, float(config.default_leverage))
         self._max_leverage = max(self._default_leverage, float(config.max_leverage))
+        self._initial_equity = max(float(config.initial_equity), 0.0)
+        self._initial_available_margin = max(float(config.initial_available_margin), 0.0)
         self._trade = TradeLifecycle(symbol=str(self._instrument_id))
         self._latest_context: Dict[str, Any] = {}
         self._pending_trigger_reason: str = ""
@@ -781,6 +785,17 @@ class LLMStrategy(Strategy):
             available = float(self.portfolio.available_balance)  # type: ignore[attr-defined]
         except Exception:
             available = total_equity
+        if total_equity <= 0.0 and self._initial_equity > 0.0:
+            total_equity = self._initial_equity
+        else:
+            self._initial_equity = max(total_equity, self._initial_equity)
+        if available <= 0.0:
+            if self._initial_available_margin > 0.0:
+                available = self._initial_available_margin
+            elif total_equity > 0.0:
+                available = total_equity
+        else:
+            self._initial_available_margin = max(available, self._initial_available_margin)
         return {"total_equity": total_equity, "available_margin": available}
 
     def _push_bot_state(self) -> None:
