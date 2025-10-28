@@ -61,6 +61,15 @@ python main.py --mode live       # 连接 Binance 与 AI 服务（需有效密�
 | 实盘 | `python main.py --mode live` | 启动 Nautilus TradingNode，实时订阅 Binance 数据并执行 AI 决策。需提前测试配置，谨慎使用真实资金。 |
 | 回测 | `python main.py --mode backtest` | 使用 Nautilus BacktestNode，读取 `data/catalog/` 数据并生成报告（`reports/<timestamp>/`）。 |
 
+## 仪表盘监控
+- 项目运行时会把风险状态与策略快照写入仓库根目录的 `dashboard_snapshot.json`。
+- 可通过 Streamlit 快速查看实时指标：
+  ```bash
+  streamlit run dashboard/streamlit_app.py
+  ```
+- 页面左侧可启用自动刷新并调整刷新间隔，核心区展示风控指标与每个合约的持仓详情、市场上下文及最新 AI 响应。
+- 若页面提示找不到快照，请先运行回测或实盘，让 `telemetry` 模块生成快照文件。
+
 ## 测试与验证
 - 回测结果是主要的回归手段：检查生成的 `metrics.csv`、`report.md`、`equity_curve.csv` 等文件。
 - 如需编写额外测试，可在新建的 `tests/` 目录中使用 `pytest`；命名遵循 `test_*.py`。
