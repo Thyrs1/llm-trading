@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Any, Deque, Dict, List, Optional
 
 import json
+import time
 
 import pandas as pd
 from msgspec import Struct
@@ -105,9 +106,26 @@ except ImportError:  # pragma: no cover
         id: str
 
     class Quantity:  # type: ignore[misc]
+        def __init__(self, value: float) -> None:
+            self._value = float(value)
+
         @staticmethod
-        def from_f64(value: float) -> float:
-            return value
+        def from_f64(value: float) -> "Quantity":
+            return Quantity(value)
+
+        @staticmethod
+        def from_str(value: str) -> "Quantity":
+            return Quantity(float(value))
+
+        @staticmethod
+        def from_int(value: int) -> "Quantity":
+            return Quantity(float(value))
+
+        def as_double(self) -> float:
+            return self._value
+
+        def __float__(self) -> float:
+            return self._value
 
 
 class LLMStrategyConfig(StrategyConfig, Struct, kw_only=True, frozen=True):
@@ -197,6 +215,16 @@ class LLMStrategy(Strategy):
     def _subscribe_market_data(self) -> None:
         if self._bars_subscribed:
             return
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            try:
+                instrument = self.instrument(self._instrument_id)  # type: ignore[attr-defined]
+                if instrument is not None:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.2)
+
         try:
             self.subscribe_bars(self._bar_type)  # type: ignore[attr-defined]
         except AttributeError:
@@ -301,23 +329,11 @@ class LLMStrategy(Strategy):
         side = (decision.side or "LONG").upper()
         order_side = OrderSide.BUY if side == "LONG" else OrderSide.SELL
 
-        quantity = None
         try:
-            instrument = self.instrument(self._instrument_id)  # type: ignore[attr-defined]
-        except Exception:
-            instrument = None
-
-        if instrument is not None:
-            try:
-                quantity = instrument.make_qty(float(self._trade_size))  # type: ignore[attr-defined]
-            except Exception:
-                quantity = None
-
-        if quantity is None:
-            try:
-                quantity = Quantity.from_f64(float(self._trade_size))  # type: ignore[attr-defined]
-            except Exception:
-                quantity = float(self._trade_size)
+            quantity = self._resolve_order_quantity()
+        except Exception as exc:
+            self.telemetry.log(f"❌ 构造交易数量失败：{exc}", str(self._instrument_id))
+            return
 
         try:
             order = self.order_factory.market(  # type: ignore[attr-defined]
@@ -355,6 +371,35 @@ class LLMStrategy(Strategy):
             str(self._instrument_id),
         )
         self._update_triggers(decision)
+
+    def _resolve_order_quantity(self) -> Quantity:
+        """
+        根据合约精度生成下单数量，失败时回退到通用数量解析。
+        """
+
+        instrument: Optional[Instrument] = None
+        try:
+            instrument = self.instrument(self._instrument_id)  # type: ignore[attr-defined]
+        except Exception:
+            instrument = None
+
+        if instrument is not None:
+            try:
+                quantity = instrument.make_qty(float(self._trade_size))  # type: ignore[attr-defined]
+                if quantity is not None:
+                    return quantity
+            except Exception as exc:
+                self.telemetry.log(
+                    f"⚠️ 合约精度转换失败，改用通用解析：{exc}",
+                    str(self._instrument_id),
+                )
+
+        normalized = self._trade_size.normalize()
+        size_str = format(normalized, "f")
+        try:
+            return Quantity.from_str(size_str)  # type: ignore[attr-defined]
+        except Exception as exc:
+            raise RuntimeError(f"无法将数量 {size_str} 转换为 Quantity") from exc
 
     def _close_position(self, decision: AIDecision, payload: DecisionPayload) -> None:
         if not self._state.has_position:

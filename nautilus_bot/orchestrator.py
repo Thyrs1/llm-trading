@@ -114,12 +114,11 @@ class TradingOrchestrator:
 
         targets = self._strategy_targets()
         account_type = self._resolve_account_type(self.settings.binance.account_type)
-        instrument_ids = frozenset(
+        strategy_ids = {
             InstrumentId.from_str(target.instrument_id) if InstrumentId is not None else target.instrument_id
             for target in targets
-        )
-        assert InstrumentProviderConfig is not None  # for type checkers
-        instrument_provider = InstrumentProviderConfig(load_ids=instrument_ids, load_all=False)
+        }
+        instrument_provider = self._build_instrument_provider(strategy_ids)
 
         data_config = BinanceDataClientConfig(
             api_key=self.settings.binance.api_key or None,
@@ -149,7 +148,49 @@ class TradingOrchestrator:
         node.add_data_client_factory(BINANCE, BinanceLiveDataClientFactory)
         node.add_exec_client_factory(BINANCE, BinanceLiveExecClientFactory)
         node.build()
+        self._warm_cache_with_targets(node, targets)
         return node
+
+    def _build_instrument_provider(self, strategy_ids: set[Any]) -> "InstrumentProviderConfig":
+        assert InstrumentProviderConfig is not None  # for type checkers
+        provider_settings = self.settings.binance.instrument_provider
+
+        load_all = provider_settings.load_all
+        filters = provider_settings.filters or None
+        filter_callable = provider_settings.filter_callable or None
+        log_warnings = provider_settings.log_warnings
+
+        load_ids: set[Any] = set(strategy_ids)
+
+        if provider_settings.load_ids:
+            for raw_id in provider_settings.load_ids:
+                try:
+                    converted = (
+                        InstrumentId.from_str(raw_id)
+                        if InstrumentId is not None
+                        else raw_id
+                    )
+                    load_ids.add(converted)
+                except Exception:
+                    # 如果拼写错误或无法解析，则忽略并在后续运行时由 Binance 报错
+                    self.telemetry.log(f"⚠️ 无法解析合约 ID：{raw_id}", "SYSTEM")
+
+        if load_all:
+            return InstrumentProviderConfig(
+                load_all=True,
+                load_ids=frozenset(load_ids) if load_ids else None,
+                filters=filters,
+                filter_callable=filter_callable,
+                log_warnings=log_warnings,
+            )
+
+        return InstrumentProviderConfig(
+            load_all=False,
+            load_ids=frozenset(load_ids) if load_ids else None,
+            filters=filters,
+            filter_callable=filter_callable,
+            log_warnings=log_warnings,
+        )
 
     def _resolve_account_type(self, value: str) -> "BinanceAccountType":
         if BinanceAccountType is None:  # pragma: no cover
@@ -205,12 +246,40 @@ class TradingOrchestrator:
             self.telemetry.log(f"⚠️ 合约元数据加载失败：{exc}", instrument_id)
             return None
 
+    def _warm_cache_with_targets(self, node: TradingNode, targets: List[InstrumentSettings]) -> None:
+        if Instrument is None:
+            return
+        seen: set[str] = set()
+        for target in targets:
+            instrument_id = target.instrument_id
+            if instrument_id in seen:
+                continue
+            seen.add(instrument_id)
+            instrument = self._fetch_instrument_metadata(instrument_id)
+            if instrument is None:
+                continue
+            if hasattr(node, "cache"):
+                try:
+                    node.cache.add_instrument(instrument)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            if hasattr(node, "trader") and hasattr(node.trader, "cache"):
+                try:
+                    node.trader.cache.add_instrument(instrument)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
     def _preload_instrument(self, node: TradingNode, target: InstrumentSettings) -> None:
         if not hasattr(node, "trader") or Instrument is None:
             return
         instrument = self._fetch_instrument_metadata(target.instrument_id)
         if instrument is None:
             return
+        try:
+            if hasattr(node, "cache"):
+                node.cache.add_instrument(instrument)  # type: ignore[attr-defined]
+        except Exception:
+            pass
         try:
             node.trader.cache.add_instrument(instrument)
         except Exception:

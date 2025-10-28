@@ -22,6 +22,18 @@ class BinanceClientSettings:
     base_http_url: Optional[str] = None
     base_ws_url: Optional[str] = None
     is_us: bool = False
+    instrument_provider: "InstrumentProviderSettings" = field(default_factory=lambda: InstrumentProviderSettings())
+
+
+@dataclass(slots=True)
+class InstrumentProviderSettings:
+    """行情合约加载配置。"""
+
+    load_all: bool = False
+    load_ids: List[str] = field(default_factory=list)
+    filters: Dict[str, Any] = field(default_factory=dict)
+    filter_callable: Optional[str] = None
+    log_warnings: bool = True
 
 
 @dataclass(slots=True)
@@ -152,6 +164,25 @@ def _apply_file_overrides(settings: BotSettings, data: Dict[str, Any]) -> None:
     settings.binance.base_http_url = binance_cfg.get("base_http_url", settings.binance.base_http_url)
     settings.binance.base_ws_url = binance_cfg.get("base_ws_url", settings.binance.base_ws_url)
     settings.binance.is_us = binance_cfg.get("is_us", settings.binance.is_us)
+
+    data_clients_cfg = data.get("data_clients", {})
+    binance_data_cfg = data_clients_cfg.get("binance", {})
+    provider_cfg = binance_data_cfg.get("instrument_provider", {})
+    if provider_cfg:
+        settings.binance.instrument_provider.load_all = provider_cfg.get(
+            "load_all",
+            settings.binance.instrument_provider.load_all,
+        )
+        load_ids_cfg = provider_cfg.get("load_ids")
+        if isinstance(load_ids_cfg, list):
+            settings.binance.instrument_provider.load_ids = [str(item) for item in load_ids_cfg]
+        filters_cfg = provider_cfg.get("filters")
+        if isinstance(filters_cfg, dict):
+            settings.binance.instrument_provider.filters = filters_cfg
+        if "filter_callable" in provider_cfg:
+            settings.binance.instrument_provider.filter_callable = provider_cfg.get("filter_callable")
+        if "log_warnings" in provider_cfg:
+            settings.binance.instrument_provider.log_warnings = bool(provider_cfg.get("log_warnings"))
 
     ai_cfg = data.get("ai", {})
     settings.ai.base_url = ai_cfg.get("base_url", settings.ai.base_url)
