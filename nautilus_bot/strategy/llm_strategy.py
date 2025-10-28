@@ -403,7 +403,28 @@ class LLMStrategy(Strategy):
         根据风险预算、杠杆与合约精度生成下单数量。
         """
 
-        effective_price = max(price, 0.0)
+        instrument: Optional[Instrument] = None
+        try:
+            instrument = self.instrument(self._instrument_id)  # type: ignore[attr-defined]
+        except Exception:
+            instrument = None
+
+        instrument_min_qty = 0.0
+        if instrument is not None:
+            try:
+                min_quantity = getattr(instrument, "min_quantity", None)
+                if min_quantity is not None:
+                    instrument_min_qty = max(self._quantity_as_float(min_quantity), 0.0)
+            except Exception:
+                instrument_min_qty = 0.0
+
+        effective_price = price if price > 0 else self._last_price
+        if effective_price <= 0 and instrument is not None:
+            try:
+                effective_price = float(getattr(instrument, "last_price", 0.0))  # type: ignore[arg-type]
+            except Exception:
+                effective_price = 0.0
+        effective_price = max(effective_price, 0.0)
         risk_cap = max(self.risk.settings.max_risk_per_trade, 0.0)
         decision_risk = decision.risk_percent
         if decision_risk is not None and decision_risk > 0:
@@ -411,10 +432,9 @@ class LLMStrategy(Strategy):
             risk_cap = min(risk_cap, max(normalized, 0.0))
         risk_cap = min(risk_cap, 1.0)
 
-        margin_budget = equity * risk_cap
+        margin_budget = max(equity * risk_cap, 0.0)
         if available_margin > 0:
-            margin_budget = min(margin_budget, available_margin)
-        margin_budget = max(margin_budget, 0.0)
+            margin_budget = min(margin_budget, available_margin) if margin_budget > 0 else available_margin
 
         desired_leverage = decision.leverage or self._default_leverage
         if desired_leverage is None or desired_leverage <= 0:
@@ -422,28 +442,55 @@ class LLMStrategy(Strategy):
         effective_leverage = min(self._max_leverage, max(float(desired_leverage), 1.0))
 
         target_qty = 0.0
+        explicit_qty = decision.quantity if decision.quantity and decision.quantity > 0 else None
+        if explicit_qty is not None:
+            target_qty = float(explicit_qty)
+        elif decision.notional and decision.notional > 0 and effective_price > 0:
+            target_qty = float(decision.notional) / effective_price
+
+        max_qty_from_risk = 0.0
         if effective_price > 0 and margin_budget > 0:
-            notional = margin_budget * effective_leverage
-            target_qty = notional / effective_price
+            max_qty_from_risk = (margin_budget * effective_leverage) / effective_price
+            if target_qty <= 0:
+                target_qty = max_qty_from_risk
 
-        if target_qty <= 0:
-            target_qty = float(self._trade_size)
+        if max_qty_from_risk > 0 and target_qty > max_qty_from_risk > 0:
+            self.telemetry.log(
+                f"⚠️ AI 请求仓位超出风险上限，按风险预算缩减至 {max_qty_from_risk:.6f}",
+                str(self._instrument_id),
+            )
+            target_qty = max_qty_from_risk
 
-        if effective_price > 0 and effective_leverage > 0 and available_margin > 0:
+        if effective_price > 0 and effective_leverage > 0 and available_margin > 0 and target_qty > 0:
             required_margin = (target_qty * effective_price) / effective_leverage
             if required_margin > available_margin and required_margin > 0:
                 scale = available_margin / required_margin
                 target_qty *= max(scale, 0.0)
+                self.telemetry.log(
+                    f"⚠️ 可用保证金不足，缩减手数至 {target_qty:.6f}",
+                    str(self._instrument_id),
+                )
 
-        self._last_risk_fraction = risk_cap
+        if target_qty <= 0:
+            fallback_qty = float(self._trade_size) if self._trade_size > 0 else instrument_min_qty
+            if fallback_qty > 0:
+                target_qty = fallback_qty
+                self.telemetry.log(
+                    f"⚠️ AI 未返回仓位规模，使用回退数量 {target_qty:.6f}",
+                    str(self._instrument_id),
+                )
+            else:
+                raise RuntimeError("AI 未提供仓位规模且无法推导最小下单量。")
+
+        required_margin = 0.0
+        if effective_price > 0 and effective_leverage > 0:
+            required_margin = (target_qty * effective_price) / effective_leverage
+
+        risk_fraction = required_margin / equity if equity > 0 else 0.0
+        capped_fraction = min(risk_fraction, risk_cap) if risk_cap > 0 else risk_fraction
+        self._last_risk_fraction = max(capped_fraction, 0.0)
         self._last_effective_leverage = effective_leverage
         self._last_target_notional = target_qty * effective_price if effective_price > 0 else 0.0
-
-        instrument: Optional[Instrument] = None
-        try:
-            instrument = self.instrument(self._instrument_id)  # type: ignore[attr-defined]
-        except Exception:
-            instrument = None
 
         if instrument is not None:
             try:
@@ -456,7 +503,7 @@ class LLMStrategy(Strategy):
                     str(self._instrument_id),
                 )
 
-        normalized = Decimal(str(max(target_qty, float(self._trade_size)))).normalize()
+        normalized = Decimal(str(target_qty)).normalize()
         size_str = format(normalized, "f")
         try:
             return Quantity.from_str(size_str)  # type: ignore[attr-defined]

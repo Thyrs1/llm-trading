@@ -556,6 +556,18 @@ def _parse_decision(decision_dict: Dict[str, Any]) -> Optional[AIDecision]:
         if isinstance(trigger, dict)
     ]
 
+    quantity: Optional[float] = None
+    for key in ("quantity", "position_size", "size"):
+        quantity = _safe_float(decision_dict.get(key))
+        if quantity:
+            break
+
+    notional: Optional[float] = None
+    for key in ("notional", "size_notional", "position_notional"):
+        notional = _safe_float(decision_dict.get(key))
+        if notional:
+            break
+
     return AIDecision(
         action=action,
         reasoning=decision_dict.get("reasoning", ""),
@@ -566,6 +578,8 @@ def _parse_decision(decision_dict: Dict[str, Any]) -> Optional[AIDecision]:
         take_profit=_safe_float(decision_dict.get("take_profit")),
         leverage=_safe_int(decision_dict.get("leverage")),
         risk_percent=_safe_float(decision_dict.get("risk_percent")),
+        quantity=quantity,
+        notional=notional,
         trailing_distance_pct=_safe_float(decision_dict.get("trailing_distance_pct")),
         new_stop_loss=_safe_float(decision_dict.get("new_stop_loss")),
         new_take_profit=_safe_float(decision_dict.get("new_take_profit")),

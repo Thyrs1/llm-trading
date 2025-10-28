@@ -81,7 +81,11 @@ def _infer_price_precision(value: str) -> int:
     return len(value.split(".", 1)[1])
 
 
-def klines_to_bars(rows: Iterable[List], bar_type_str: str) -> List[Bar]:
+def klines_to_bars(
+    rows: Iterable[List],
+    bar_type_str: str,
+    size_precision: Optional[int] = None,
+) -> List[Bar]:
     bar_type = BarType.from_str(bar_type_str)
     bars: List[Bar] = []
     for row in rows:
@@ -91,7 +95,10 @@ def klines_to_bars(rows: Iterable[List], bar_type_str: str) -> List[Bar]:
         high_price = Price(float(row[2]), _infer_price_precision(row[2]))
         low_price = Price(float(row[3]), _infer_price_precision(row[3]))
         close_price = Price(float(row[4]), _infer_price_precision(row[4]))
-        volume = Quantity(float(row[5]), _infer_price_precision(row[5]))
+        volume_precision = _infer_price_precision(row[5])
+        if size_precision is not None and size_precision >= 0:
+            volume_precision = max(volume_precision, size_precision)
+        volume = Quantity(float(row[5]), volume_precision)
 
         bars.append(
             Bar(
@@ -192,8 +199,10 @@ def ensure_catalog_data(
     settings = load_settings()
     account_type = _resolve_account_type(settings.binance.account_type)
     instrument = _fetch_instrument(settings, instrument_id, account_type)
+    instrument_size_precision: Optional[int] = None
     if instrument is not None:
         try:
+            instrument_size_precision = int(getattr(instrument, "size_precision", 0) or 0)
             catalog.write_data([instrument])
             logger.info("Stored instrument metadata for %s", instrument_id)
         except Exception as exc:  # pragma: no cover - 已存在等情况
@@ -214,7 +223,7 @@ def ensure_catalog_data(
     if not rows:
         raise BinanceDownloaderError("No data returned for requested range")
 
-    bars = klines_to_bars(rows, bar_type_str=bar_type)
+    bars = klines_to_bars(rows, bar_type_str=bar_type, size_precision=instrument_size_precision)
     catalog.write_data(bars)
     logger.info(
         "Stored %d bars in catalog %s for %s",

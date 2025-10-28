@@ -72,7 +72,7 @@ class InstrumentSettings:
     binance_interval: str = "5m"
     bar_history: int = 720
     min_history: int = 120
-    trade_size: float = 0.01
+    trade_size: float = 0.0
     order_id_tag: str = "LLM"
     analysis_cooldown_secs: int = 300
     default_leverage: float = 10.0
@@ -89,7 +89,7 @@ class StrategySettings:
     binance_interval: str = "5m"
     bar_history: int = 720
     min_history: int = 120
-    trade_size: float = 0.01
+    trade_size: float = 0.0
     order_id_tag: str = "LLM"
     analysis_cooldown_secs: int = 300
     default_leverage: float = 10.0

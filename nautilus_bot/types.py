@@ -37,6 +37,8 @@ class AIDecision:
     take_profit: Optional[float] = None
     leverage: Optional[int] = None
     risk_percent: Optional[float] = None
+    quantity: Optional[float] = None
+    notional: Optional[float] = None
     trailing_distance_pct: Optional[float] = None
     new_stop_loss: Optional[float] = None
     new_take_profit: Optional[float] = None
