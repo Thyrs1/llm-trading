@@ -6,6 +6,11 @@ base_http_url = ""
 base_ws_url = ""
 is_us = false
 
+  [binance.instrument_provider]
+  load_all = false            # 推荐仅加载需要的合约
+  load_ids = []               # 额外预热的合约 ID 列表，可留空
+  log_warnings = true
+
 [ai]
 base_url = "https://api.deepseek.com/v1"
 api_key = "YOUR_DEEPSEEK_KEY"
@@ -34,6 +39,18 @@ order_id_tag = "LLM"
 analysis_cooldown_secs = 300
 default_leverage = 10.0
 max_leverage = 50.0
+
+# 可选：批量定义多合约配置，未填写时沿用上方默认值
+# [[strategy.instruments]]
+# instrument_id = "SOLUSDT-PERP.BINANCE"
+# bar_type = "SOLUSDT-PERP.BINANCE-5-MINUTE-LAST-EXTERNAL"
+# binance_symbol = "SOLUSDT"
+# binance_interval = "5m"
+# trade_size = 0.0
+# order_id_tag = "LLM01"
+# analysis_cooldown_secs = 300
+# default_leverage = 10.0
+# max_leverage = 50.0
 
 [telemetry]
 database_path = "trading_data.db"

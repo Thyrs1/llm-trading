@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, Iterable, Iterator, List, Optional
 
 import json
 import time
@@ -28,7 +29,7 @@ from nautilus_bot.utils.triggers import TriggerManager
 try:  # pragma: no cover
     from nautilus_trader.config import StrategyConfig
     from nautilus_trader.model.data import Bar, BarType
-    from nautilus_trader.model.enums import OrderSide, TimeInForce
+    from nautilus_trader.model.enums import BarAggregation, OrderSide, TimeInForce
     from nautilus_trader.model.events.order import OrderCanceled, OrderFilled, OrderRejected
     from nautilus_trader.model.events.position import PositionClosed
     from nautilus_trader.model.identifiers import InstrumentId
@@ -56,6 +57,12 @@ except ImportError:  # pragma: no cover
         @staticmethod
         def from_str(value: str) -> str:
             return value
+
+    class BarAggregation:  # type: ignore[misc]
+        SECOND = "SECOND"
+        MINUTE = "MINUTE"
+        HOUR = "HOUR"
+        DAY = "DAY"
 
     class OrderSide:  # type: ignore[misc]
         BUY = "BUY"
@@ -128,7 +135,7 @@ except ImportError:  # pragma: no cover
             return self._value
 
 
-class LLMStrategyConfig(StrategyConfig, Struct, kw_only=True, frozen=True):
+class InstrumentSpec(Struct, kw_only=True, frozen=True):
     instrument_id: str
     bar_type: str
     trade_size: float
@@ -138,12 +145,74 @@ class LLMStrategyConfig(StrategyConfig, Struct, kw_only=True, frozen=True):
     order_id_tag: str = "LLM"
     default_leverage: float = 10.0
     max_leverage: float = 50.0
+    binance_symbol: Optional[str] = None
+    binance_interval: Optional[str] = None
+
+
+class LLMStrategyConfig(StrategyConfig, Struct, kw_only=True, frozen=True):
+    instruments: List[InstrumentSpec]
     initial_equity: float = 0.0
     initial_available_margin: float = 0.0
 
 
+@dataclass(slots=True)
+class InstrumentContext:
+    """承载单个合约的运行时状态。"""
+
+    config: InstrumentSpec
+    _instrument_id: "InstrumentId"
+    _bar_type: "BarType"
+    _history: Deque[dict]
+    _context_history: Deque[str]
+    _state: StrategyState
+    _trigger_manager: TriggerManager
+    _last_analysis_ts: float
+    _trade_size: Decimal
+    _default_leverage: float
+    _max_leverage: float
+    _initial_equity: float
+    _initial_available_margin: float
+    _trade: TradeLifecycle
+    _latest_context: Dict[str, Any]
+    _pending_trigger_reason: str
+    _last_price: float
+    _instrument_ready: bool
+    _bars_subscribed: bool
+    _last_effective_leverage: float
+    _last_risk_fraction: float
+    _last_target_notional: float
+    _bootstrap_requested: bool
+
+
 class LLMStrategy(Strategy):
     """基于 Nautilus 事件引擎的 LLM 决策策略。"""
+
+    _CONTEXT_FIELDS: frozenset[str] = frozenset(
+        {
+            "_instrument_id",
+            "_bar_type",
+            "_history",
+            "_context_history",
+            "_state",
+            "_trigger_manager",
+            "_last_analysis_ts",
+            "_trade_size",
+            "_default_leverage",
+            "_max_leverage",
+            "_initial_equity",
+            "_initial_available_margin",
+            "_trade",
+            "_latest_context",
+            "_pending_trigger_reason",
+            "_last_price",
+            "_instrument_ready",
+            "_bars_subscribed",
+            "_last_effective_leverage",
+            "_last_risk_fraction",
+            "_last_target_notional",
+            "_bootstrap_requested",
+        }
+    )
 
     def __init__(
         self,
@@ -160,56 +229,172 @@ class LLMStrategy(Strategy):
             risk_controller = risk_controller or RiskController(fallback_settings.risk)
             telemetry = telemetry or TelemetryStore(fallback_settings)
 
-        self.ai_service = ai_service
-        self.risk = risk_controller
-        self.telemetry = telemetry
+        object.__setattr__(self, "ai_service", ai_service)
+        object.__setattr__(self, "risk", risk_controller)
+        object.__setattr__(self, "telemetry", telemetry)
 
-        self._instrument_id = InstrumentId.from_str(config.instrument_id)
-        self._bar_type = BarType.from_str(config.bar_type)
-        self._history: Deque[dict] = deque(maxlen=config.bar_history)
-        self._context_history: Deque[str] = deque(maxlen=12)
-        self._state: StrategyState = StrategyState()
-        self._trigger_manager = TriggerManager(symbol=str(self._instrument_id))
-        self._last_analysis_ts: float = 0.0
-        self._trade_size = Decimal(str(config.trade_size))
-        self._default_leverage = max(1.0, float(config.default_leverage))
-        self._max_leverage = max(self._default_leverage, float(config.max_leverage))
-        self._initial_equity = max(float(config.initial_equity), 0.0)
-        self._initial_available_margin = max(float(config.initial_available_margin), 0.0)
-        self._trade = TradeLifecycle(symbol=str(self._instrument_id))
-        self._latest_context: Dict[str, Any] = {}
-        self._pending_trigger_reason: str = ""
-        self._last_price: float = 0.0
-        self._instrument_ready: bool = False
-        self._bars_subscribed: bool = False
-        self._last_effective_leverage: float = self._default_leverage
-        self._last_risk_fraction: float = self.risk.settings.max_risk_per_trade
-        self._last_target_notional: float = 0.0
+        specs = self._normalize_specs(config.instruments)
+        if not specs:
+            raise ValueError("LLMStrategy 至少需要一个交易合约配置。")
+
+        initial_equity = max(float(config.initial_equity), 0.0)
+        initial_available = max(float(config.initial_available_margin), 0.0)
+
+        contexts: Dict[str, InstrumentContext] = {}
+        for spec in specs:
+            ctx = self._create_context(
+                spec=spec,
+                initial_equity=initial_equity,
+                initial_available=initial_available,
+            )
+            contexts[str(ctx._instrument_id)] = ctx
+
+        object.__setattr__(self, "_contexts", contexts)
+        object.__setattr__(self, "_active_ctx", None)
+
+    @staticmethod
+    def _normalize_specs(instruments: Iterable[InstrumentSpec]) -> List[InstrumentSpec]:
+        specs = list(instruments or [])
+        if not specs:
+            return []
+
+        normalized: List[InstrumentSpec] = []
+        used_tags: Dict[str, None] = {}
+        for spec in specs:
+            tag = spec.order_id_tag or "LLM"
+            base = tag
+            suffix = 1
+            while tag in used_tags:
+                tag = f"{base}{suffix:02d}"
+                suffix += 1
+            used_tags[tag] = None
+            if tag != spec.order_id_tag:
+                spec = InstrumentSpec(
+                    instrument_id=spec.instrument_id,
+                    bar_type=spec.bar_type,
+                    trade_size=spec.trade_size,
+                    min_history=spec.min_history,
+                    bar_history=spec.bar_history,
+                    analysis_cooldown_secs=spec.analysis_cooldown_secs,
+                    order_id_tag=tag,
+                    default_leverage=spec.default_leverage,
+                    max_leverage=spec.max_leverage,
+                    binance_symbol=spec.binance_symbol,
+                    binance_interval=spec.binance_interval,
+                )
+            normalized.append(spec)
+        return normalized
+
+    def _create_context(
+        self,
+        spec: InstrumentSpec,
+        initial_equity: float,
+        initial_available: float,
+    ) -> InstrumentContext:
+        instrument_id = InstrumentId.from_str(spec.instrument_id)
+        bar_type = BarType.from_str(spec.bar_type)
+        default_leverage = max(1.0, float(spec.default_leverage))
+        max_leverage = max(default_leverage, float(spec.max_leverage))
+        return InstrumentContext(
+            config=spec,
+            _instrument_id=instrument_id,
+            _bar_type=bar_type,
+            _history=deque(maxlen=spec.bar_history),
+            _context_history=deque(maxlen=12),
+            _state=StrategyState(),
+            _trigger_manager=TriggerManager(symbol=str(instrument_id)),
+            _last_analysis_ts=0.0,
+            _trade_size=Decimal(str(spec.trade_size)),
+            _default_leverage=default_leverage,
+            _max_leverage=max_leverage,
+            _initial_equity=initial_equity,
+            _initial_available_margin=initial_available,
+            _trade=TradeLifecycle(symbol=str(instrument_id)),
+            _latest_context={},
+            _pending_trigger_reason="",
+            _last_price=0.0,
+            _instrument_ready=False,
+            _bars_subscribed=False,
+            _last_effective_leverage=default_leverage,
+            _last_risk_fraction=self.risk.settings.max_risk_per_trade,
+            _last_target_notional=0.0,
+            _bootstrap_requested=False,
+        )
+
+    def _get_context(self, instrument_id: Any) -> Optional[InstrumentContext]:
+        return self._contexts.get(str(instrument_id))
+
+    @contextmanager
+    def _activate_context(self, context: InstrumentContext) -> Iterator[InstrumentContext]:
+        prev = self._active_ctx
+        object.__setattr__(self, "_active_ctx", context)
+        try:
+            yield context
+        finally:
+            object.__setattr__(self, "_active_ctx", prev)
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._CONTEXT_FIELDS and self._active_ctx is not None:
+            return getattr(self._active_ctx, name)
+        raise AttributeError(f"{type(self).__name__} 对象不存在属性 {name!r}")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in self._CONTEXT_FIELDS:
+            active = object.__getattribute__(self, "_active_ctx")
+            if active is None:
+                raise AttributeError(
+                    f"未激活上下文时无法写入属性 {name!r}，请在 _activate_context 内操作。",
+                )
+            setattr(active, name, value)
+            return
+        object.__setattr__(self, name, value)
+
+    @property
+    def _instrument_config(self) -> InstrumentSpec:
+        if self._active_ctx is None:
+            raise RuntimeError("当前调用不在具体合约上下文内。")
+        return self._active_ctx.config
 
     # ------------------------------------------------------------------ #
     # Nautilus 生命周期钩子
     # ------------------------------------------------------------------ #
 
     def on_start(self) -> None:  # pragma: no cover - 依赖 Nautilus 回调
-        self.telemetry.log("🚀 LLM 策略启动", str(self._instrument_id))
+        self.telemetry.log("🚀 LLM 策略启动", "SYSTEM")
         try:
             self.ai_service.initialize()
         except Exception as exc:  # noqa: BLE001
-            self.telemetry.log(f"⚠️ AI 服务初始化失败：{exc}", str(self._instrument_id))
-        try:
-            instrument = self.request_instrument(self._instrument_id)  # type: ignore[attr-defined]
-            if instrument is not None:
-                self._handle_instrument_ready(instrument)  # type: ignore[arg-type]
-        except AttributeError:
-            # 本地降级模式仅用于静态检查
-            pass
-        except Exception as exc:  # noqa: BLE001
-            self.telemetry.log(f"⚠️ 请求合约信息失败：{exc}", str(self._instrument_id))
+            self.telemetry.log(f"⚠️ AI 服务初始化失败：{exc}", "SYSTEM")
+
+        for context in self._contexts.values():
+            with self._activate_context(context):
+                self._start_context()
 
     def on_instrument(self, instrument: Instrument) -> None:  # pragma: no cover - 依赖 Nautilus 回调
-        if str(getattr(instrument, "id", instrument)) != str(self._instrument_id):
+        ctx = self._get_context(getattr(instrument, "id", instrument))
+        if ctx is None:
             return
-        self._handle_instrument_ready(instrument)
+        with self._activate_context(ctx):
+            self._handle_instrument_ready(instrument)
+
+    def _start_context(self) -> None:
+        self.telemetry.log("🚀 LLM 策略启动", str(self._instrument_id))
+        instrument = self._fetch_cached_instrument()
+        if instrument is not None:
+            self._handle_instrument_ready(instrument)
+            return
+        self.telemetry.log("⌛ 合约尚未出现在缓存中，等待交易所回调。", str(self._instrument_id))
+
+    def _fetch_cached_instrument(self) -> Optional[Instrument]:
+        try:
+            cache = getattr(self, "cache", None)
+            if cache is not None:
+                instrument = cache.instrument(self._instrument_id)
+                if instrument is not None:
+                    return instrument
+        except Exception:
+            pass
+        return None
 
     def _handle_instrument_ready(self, instrument: Instrument) -> None:
         if self._instrument_ready:
@@ -221,19 +406,84 @@ class LLMStrategy(Strategy):
             pass
         self._instrument_ready = True
         self.telemetry.log("📦 已加载交易合约信息。", str(self._instrument_id))
+        self._bootstrap_history()
         self._subscribe_market_data()
+
+    def _bootstrap_history(self) -> None:
+        if self._bootstrap_requested:
+            return
+
+        min_history = max(int(self._instrument_config.min_history), 0)
+        if min_history <= 0:
+            return
+
+        interval_seconds = self._bar_interval_seconds()
+        if interval_seconds is None:
+            return
+
+        end = self.clock.utc_now()
+        start = end - timedelta(seconds=interval_seconds * (min_history + 5))
+
+        try:
+            self._bootstrap_requested = True
+            self.request_bars(  # type: ignore[attr-defined]
+                self._bar_type,
+                start=start,
+                end=end,
+                limit=min_history,
+                update_catalog=False,
+            )
+            self.telemetry.log(
+                (
+                    f"📥 已请求历史 K 线以填充上下文："
+                    f"{min_history} 根，窗口 {start.isoformat()} ~ {end.isoformat()}"
+                ),
+                str(self._instrument_id),
+            )
+        except AttributeError:
+            self._bootstrap_requested = False
+        except Exception as exc:  # noqa: BLE001
+            self._bootstrap_requested = False
+            self.telemetry.log(f"⚠️ 历史 K 线请求失败：{exc}", str(self._instrument_id))
+
+    def _bar_interval_seconds(self) -> Optional[int]:
+        spec = getattr(self._bar_type, "bar_spec", None)
+        if spec is None:
+            return None
+
+        step = getattr(spec, "step", None)
+        aggregation = getattr(spec, "aggregation", None)
+        if step is None or aggregation is None:
+            return None
+
+        try:
+            step_value = int(step)
+        except Exception:
+            return None
+
+        agg_name = getattr(aggregation, "name", None) or getattr(aggregation, "value", None)
+        if agg_name is None:
+            agg_name = str(aggregation)
+        agg_name = str(agg_name).upper()
+
+        base = {
+            "SECOND": 1,
+            "MINUTE": 60,
+            "HOUR": 3600,
+            "DAY": 86400,
+        }.get(agg_name)
+        if base is None:
+            return None
+        return step_value * base
 
     def _subscribe_market_data(self) -> None:
         if self._bars_subscribed:
             return
         deadline = time.time() + 10.0
         while time.time() < deadline:
-            try:
-                instrument = self.instrument(self._instrument_id)  # type: ignore[attr-defined]
-                if instrument is not None:
-                    break
-            except Exception:
-                pass
+            instrument = self._fetch_cached_instrument()
+            if instrument is not None:
+                break
             time.sleep(0.2)
 
         try:
@@ -248,14 +498,24 @@ class LLMStrategy(Strategy):
         self.telemetry.log("📡 已订阅 5m 行情。", str(self._instrument_id))
 
     def on_bar(self, bar: Bar) -> None:  # pragma: no cover - 依赖 Nautilus 回调
+        ctx = self._get_context(getattr(bar, "instrument_id", None))
+        if ctx is None:
+            return
+        with self._activate_context(ctx):
+            self._on_bar_context(bar)
+
+    def _on_bar_context(self, bar: Bar) -> None:
         self._append_bar(bar)
-        if len(self._history) < self.config.min_history:
+        if len(self._history) < self._instrument_config.min_history:
             return
 
         now_ts = bar.end_time.timestamp() if hasattr(bar, "end_time") else self.clock.utc_now().timestamp()
         reason_text = "定期分析"
-        if now_ts - self._last_analysis_ts < self.config.analysis_cooldown_secs:
-            should, reason = self._trigger_manager.should_analyze(self._history_df, self.config.analysis_cooldown_secs)
+        if now_ts - self._last_analysis_ts < self._instrument_config.analysis_cooldown_secs:
+            should, reason = self._trigger_manager.should_analyze(
+                self._history_df,
+                self._instrument_config.analysis_cooldown_secs,
+            )
             if not should:
                 self._pending_trigger_reason = ""
                 return
@@ -268,7 +528,7 @@ class LLMStrategy(Strategy):
         active_triggers = [self._serialize_trigger(trigger) for trigger in self._trigger_manager.triggers]
         snapshot = MarketSnapshot(
             instrument_id=str(self._instrument_id),
-            timeframe=self.config.bar_type,
+            timeframe=self._instrument_config.bar_type,
             current_price=float(getattr(bar, "close", 0.0)),
             ohlcv=self._history_df.copy(),
             metadata={
@@ -545,9 +805,13 @@ class LLMStrategy(Strategy):
     # ------------------------------------------------------------------ #
 
     def on_order_filled(self, event: OrderFilled) -> None:  # pragma: no cover - 依赖 Nautilus 回调
-        if not self._is_same_instrument(event.instrument_id):
+        ctx = self._get_context(getattr(event, "instrument_id", None))
+        if ctx is None:
             return
+        with self._activate_context(ctx):
+            self._handle_order_filled(event)
 
+    def _handle_order_filled(self, event: OrderFilled) -> None:
         price = self._safe_float(getattr(event, "last_px", None))
         quantity = abs(self._safe_float(getattr(event, "last_qty", None)))
         if quantity <= 0:
@@ -600,53 +864,56 @@ class LLMStrategy(Strategy):
         self._push_bot_state()
 
     def on_order_canceled(self, event: OrderCanceled) -> None:  # pragma: no cover - 依赖 Nautilus 回调
-        if not self._is_same_instrument(event.instrument_id):
+        ctx = self._get_context(getattr(event, "instrument_id", None))
+        if ctx is None:
             return
+        with self._activate_context(ctx):
+            if self._state.is_closing:
+                self.telemetry.log("⚠️ 平仓订单被取消，保持持仓等待。", str(self._instrument_id))
+                self._state.is_closing = False
+                return
 
-        if self._state.is_closing:
-            self.telemetry.log("⚠️ 平仓订单被取消，保持持仓等待。", str(self._instrument_id))
-            self._state.is_closing = False
-            return
-
-        if self._trade.entry_time is None:
-            self.telemetry.log("⚠️ 开仓订单被取消。", str(self._instrument_id))
-            self._reset_pending_order()
+            if self._trade.entry_time is None:
+                self.telemetry.log("⚠️ 开仓订单被取消。", str(self._instrument_id))
+                self._reset_pending_order()
 
     def on_order_rejected(self, event: OrderRejected) -> None:  # pragma: no cover - 依赖 Nautilus 回调
-        if not self._is_same_instrument(event.instrument_id):
+        ctx = self._get_context(getattr(event, "instrument_id", None))
+        if ctx is None:
             return
+        with self._activate_context(ctx):
+            reason = getattr(event, "reason", "未知原因")
+            if self._state.is_closing:
+                self.telemetry.log(f"❌ 平仓订单被拒绝：{reason}", str(self._instrument_id))
+                self._state.is_closing = False
+                return
 
-        reason = getattr(event, "reason", "未知原因")
-        if self._state.is_closing:
-            self.telemetry.log(f"❌ 平仓订单被拒绝：{reason}", str(self._instrument_id))
-            self._state.is_closing = False
-            return
-
-        self.telemetry.log(f"❌ 开仓订单被拒绝：{reason}", str(self._instrument_id))
-        self._reset_pending_order()
+            self.telemetry.log(f"❌ 开仓订单被拒绝：{reason}", str(self._instrument_id))
+            self._reset_pending_order()
 
     def on_position_closed(self, event: PositionClosed) -> None:  # pragma: no cover - 依赖 Nautilus 回调
-        if not self._is_same_instrument(event.instrument_id):
+        ctx = self._get_context(getattr(event, "instrument_id", None))
+        if ctx is None:
             return
+        with self._activate_context(ctx):
+            self.telemetry.log("✅ 仓位已完全关闭。", str(self._instrument_id))
+            close_price = self._safe_float(getattr(event, "avg_px_close", None)) or self._safe_float(
+                getattr(event, "last_px", None),
+            )
+            close_time = self._event_time(getattr(event, "ts_closed", None) or getattr(event, "ts_event", None))
+            pnl = self._safe_float(getattr(event, "realized_pnl", None))
+            pnl_pct = self._safe_float(getattr(event, "realized_return", None))
 
-        self.telemetry.log("✅ 仓位已完全关闭。", str(self._instrument_id))
-        close_price = self._safe_float(getattr(event, "avg_px_close", None)) or self._safe_float(
-            getattr(event, "last_px", None),
-        )
-        close_time = self._event_time(getattr(event, "ts_closed", None) or getattr(event, "ts_event", None))
-        pnl = self._safe_float(getattr(event, "realized_pnl", None))
-        pnl_pct = self._safe_float(getattr(event, "realized_return", None))
+            self._trade.exit_price = close_price or self._trade.exit_price or self._last_price
+            self._trade.exit_time = close_time
+            self._trade.realized_pnl = pnl
+            self._trade.realized_return = pnl_pct
+            self._trade.exit_order_id = getattr(event, "closing_order_id", None) or self._trade.exit_order_id
 
-        self._trade.exit_price = close_price or self._trade.exit_price or self._last_price
-        self._trade.exit_time = close_time
-        self._trade.realized_pnl = pnl
-        self._trade.realized_return = pnl_pct
-        self._trade.exit_order_id = getattr(event, "closing_order_id", None) or self._trade.exit_order_id
-
-        self._finalize_trade()
-        self._state = StrategyState()
-        self._trigger_manager.clear()
-        self._push_bot_state()
+            self._finalize_trade()
+            self._state = StrategyState()
+            self._trigger_manager.clear()
+            self._push_bot_state()
 
     # ------------------------------------------------------------------ #
     # 状态与上下文更新
@@ -827,9 +1094,6 @@ class LLMStrategy(Strategy):
         if not self._state.has_position:
             self._trade = TradeLifecycle(symbol=str(self._instrument_id))
         self._push_bot_state()
-
-    def _is_same_instrument(self, instrument_id: Any) -> bool:
-        return str(instrument_id) == str(self._instrument_id)
 
     @staticmethod
     def _safe_float(value: Any) -> float:

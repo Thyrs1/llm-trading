@@ -12,7 +12,7 @@
 ├── nautilus_bot/
 │   ├── __init__.py
 │   ├── config.py              # 配置数据类 + 环境加载
-│   ├── orchestrator.py        # 构建 TradingNode / BacktestNode，调度策略与依赖
+│   ├── runtime.py             # 构建 TradingNode / BacktestNode，调度策略与依赖
 │   ├── ai_service.py          # LLM 与情绪分析封装
 │   ├── telemetry.py           # SQLite 遥测、事件记录
 │   ├── risk.py                # 风险状态跟踪与统一接口
@@ -32,7 +32,7 @@
 - `nautilus_bot.telemetry`：整合原 `database_manager` 功能，改用事件驱动写库，同时给 Nautilus `Event` 的监听器使用。
 - `nautilus_bot.strategy.llm_strategy.LLMStrategy`：继承 `Strategy`，在 `on_bar` 钩子内调用 AI 服务、风险管理，并向 Engine 发出下单或调整请求。
 - `nautilus_bot.risk.RiskController`：统一管理日内回撤、连亏等限制，作为策略依赖注入。
-- `nautilus_bot.orchestrator`：根据运行模式（live/backtest）构建 TradingNode / BacktestNode，加载配置、注册策略与服务，并暴露 `run_live()`/`run_backtest()`。
+- `nautilus_bot.runtime`：根据运行模式（live/backtest）构建 TradingNode / BacktestNode，加载配置、注册策略与服务，并暴露 `run_live()`/`run_backtest()`。
 
 ## 迁移现状
 - 旧版脚本（如 `advanced_backtester.py`、`execution_manager.py` 等）已从主分支移除。

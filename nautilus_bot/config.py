@@ -29,7 +29,7 @@ class BinanceClientSettings:
 class InstrumentProviderSettings:
     """行情合约加载配置。"""
 
-    load_all: bool = True
+    load_all: bool = False
     load_ids: List[str] = field(default_factory=list)
     filters: Dict[str, Any] = field(default_factory=dict)
     filter_callable: Optional[str] = None
@@ -176,7 +176,10 @@ def _apply_file_overrides(settings: BotSettings, data: Dict[str, Any]) -> None:
 
     data_clients_cfg = data.get("data_clients", {})
     binance_data_cfg = data_clients_cfg.get("binance", {})
-    provider_cfg = binance_data_cfg.get("instrument_provider", {})
+    provider_cfg = binance_cfg.get("instrument_provider", {}) or binance_data_cfg.get(
+        "instrument_provider",
+        {},
+    )
     if provider_cfg:
         settings.binance.instrument_provider.load_all = provider_cfg.get(
             "load_all",

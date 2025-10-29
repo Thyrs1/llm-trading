@@ -16,7 +16,7 @@
 ```
 ├── main.py                    # 统一启动入口
 ├── nautilus_bot/
-│   ├── orchestrator.py        # 构建 AI、风险、遥测与 Nautilus 节点
+│   ├── runtime.py             # 构建 AI、风险、遥测与 Nautilus 节点
 │   ├── strategy/llm_strategy.py # LLM 决策策略
 │   ├── telemetry.py / risk.py # 遥测与风险控制服务
 │   └── utils/                 # 触发器等辅助工具
@@ -52,7 +52,7 @@ python main.py --mode live       # 连接 Binance 与 AI 服务（需有效密�
 ## 配置要点
 - `binance.*`：填写现货/合约 API Key、Secret、Base URL 及保证金模式。
 - `ai.*`：配置 LLM 调用信息（如 Base URL、模型名称、情绪分析开关等）。
-- `strategy.*`：指定交易合约、时间框架与分析冷却时间；`default_leverage`/`max_leverage` 控制 AI 允许的杠杆范围，`trade_size` 默认为 `0.0`，仅在 AI 未提供仓位规模时作为保底 fallback。
+- `strategy.*`：指定默认交易合约、时间框架与分析冷却时间；支持通过 `[[strategy.instruments]]` 追加多标的配置，每项可覆盖 `instrument_id`、`bar_type`、`order_id_tag` 等字段。`default_leverage`/`max_leverage` 控制 AI 允许的杠杆范围，`trade_size` 默认为 `0.0`，仅在 AI 未提供仓位规模时作为保底 fallback。
 - `backtest.*`：设置回测时间区间、catalog 路径，以及 `starting_balances`、`account_type`（当前 Nautilus 仅支持 `CASH/MARGIN/BETTING`，默认采用 `MARGIN` 来模拟永续账户）、`base_currency` 等账户参数，建议与实盘保持一致。
 - AI 侧会通过 `RISK_PERCENT` / `POSITION_SIZE` / `POSITION_NOTIONAL` 决定实际仓位，策略仅在信息缺失时回退到合约最小手数或 `trade_size`。
 

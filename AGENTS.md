@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## 项目结构与模块分工
-- `nautilus_bot/`：核心代码。`strategy/llm_strategy.py` 负责 LLM 策略逻辑，`orchestrator.py` 负责装配 AI、风险与 Nautilus 节点，`telemetry.py`、`risk.py`、`utils/` 提供配套服务。
+- `nautilus_bot/`：核心代码。`strategy/llm_strategy.py` 负责多标的 LLM 策略逻辑，`runtime.py` 负责装配 AI、风险与 Nautilus 节点，`telemetry.py`、`risk.py`、`utils/` 提供配套服务。
 - `main.py`：统一入口，支持 `--mode live`（实盘）与 `--mode backtest`（回测）。
 - `data/`：运行期生成的 K 线目录（默认空，保留 `.gitkeep`）。
 - `docs/`：设计文档与配置说明。

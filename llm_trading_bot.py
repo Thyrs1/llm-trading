@@ -3,12 +3,14 @@
 该脚本保留是为了兼容历史调用方式。
 """
 
-from nautilus_bot.orchestrator import build_orchestrator
+import asyncio
+
+from nautilus_bot.runtime import load_bot_settings, run_live
 
 
 def main() -> None:
-    orchestrator = build_orchestrator()
-    orchestrator.run_live()
+    settings = load_bot_settings(None)
+    asyncio.run(run_live(settings))
 
 
 if __name__ == "__main__":

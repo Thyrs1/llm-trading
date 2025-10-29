@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 
-from nautilus_bot.orchestrator import build_orchestrator
+import asyncio
+
+from nautilus_bot.runtime import load_bot_settings, run_backtest, run_live
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,11 +26,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    orchestrator = build_orchestrator(args.config)
+    settings = load_bot_settings(args.config)
     if args.mode == "live":
-        orchestrator.run_live()
+        asyncio.run(run_live(settings))
     else:
-        orchestrator.run_backtest()
+        run_backtest(settings)
 
 
 if __name__ == "__main__":
