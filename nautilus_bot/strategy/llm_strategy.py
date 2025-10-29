@@ -12,6 +12,7 @@ import time
 
 import pandas as pd
 from msgspec import Struct
+from types import SimpleNamespace
 
 from nautilus_bot.ai_service import AIService, DecisionPayload
 from nautilus_bot.config import BotSettings, load_settings
@@ -153,6 +154,7 @@ class LLMStrategyConfig(StrategyConfig, Struct, kw_only=True, frozen=True):
     instruments: List[InstrumentSpec]
     initial_equity: float = 0.0
     initial_available_margin: float = 0.0
+    force_initial_analysis: bool = False
 
 
 @dataclass(slots=True)
@@ -182,6 +184,8 @@ class InstrumentContext:
     _last_risk_fraction: float
     _last_target_notional: float
     _bootstrap_requested: bool
+    _initial_analysis_done: bool
+    _history_log_flag: bool
 
 
 class LLMStrategy(Strategy):
@@ -211,6 +215,8 @@ class LLMStrategy(Strategy):
             "_last_risk_fraction",
             "_last_target_notional",
             "_bootstrap_requested",
+            "_initial_analysis_done",
+            "_history_log_flag",
         }
     )
 
@@ -232,6 +238,7 @@ class LLMStrategy(Strategy):
         object.__setattr__(self, "ai_service", ai_service)
         object.__setattr__(self, "risk", risk_controller)
         object.__setattr__(self, "telemetry", telemetry)
+        object.__setattr__(self, "_force_initial_analysis", bool(config.force_initial_analysis))
 
         specs = self._normalize_specs(config.instruments)
         if not specs:
@@ -241,6 +248,7 @@ class LLMStrategy(Strategy):
         initial_available = max(float(config.initial_available_margin), 0.0)
 
         contexts: Dict[str, InstrumentContext] = {}
+        contexts_by_bar_type: Dict[str, InstrumentContext] = {}
         for spec in specs:
             ctx = self._create_context(
                 spec=spec,
@@ -248,8 +256,11 @@ class LLMStrategy(Strategy):
                 initial_available=initial_available,
             )
             contexts[str(ctx._instrument_id)] = ctx
+            bar_type_key = self._normalize_bar_type_key(ctx._bar_type)
+            contexts_by_bar_type[bar_type_key] = ctx
 
         object.__setattr__(self, "_contexts", contexts)
+        object.__setattr__(self, "_contexts_by_bar_type", contexts_by_bar_type)
         object.__setattr__(self, "_active_ctx", None)
 
     @staticmethod
@@ -319,10 +330,36 @@ class LLMStrategy(Strategy):
             _last_risk_fraction=self.risk.settings.max_risk_per_trade,
             _last_target_notional=0.0,
             _bootstrap_requested=False,
+            _initial_analysis_done=False,
+            _history_log_flag=False,
         )
 
-    def _get_context(self, instrument_id: Any) -> Optional[InstrumentContext]:
-        return self._contexts.get(str(instrument_id))
+    def _get_context(self, instrument_id: Any, bar_type: Any = None) -> Optional[InstrumentContext]:
+        key = None if instrument_id is None else str(instrument_id)
+        if key is not None:
+            ctx = self._contexts.get(key)
+            if ctx is not None:
+                return ctx
+        lookup = None
+        if bar_type is not None:
+            lookup = self._normalize_bar_type_key(bar_type)
+            ctx = self._contexts_by_bar_type.get(lookup)
+            if ctx is not None:
+                return ctx
+        # 调试日志便于排查为什么历史数据没有归入上下文
+        symbol = str(instrument_id or lookup or bar_type)
+        self.telemetry.log(
+            f"⚙️ 未找到上下文：instrument_id={instrument_id}, bar_type={bar_type}",
+            symbol,
+        )
+        return None
+
+    @staticmethod
+    def _normalize_bar_type_key(bar_type: Any) -> str:
+        try:
+            return str(getattr(bar_type, "value", bar_type))
+        except Exception:
+            return str(bar_type)
 
     @contextmanager
     def _activate_context(self, context: InstrumentContext) -> Iterator[InstrumentContext]:
@@ -384,6 +421,150 @@ class LLMStrategy(Strategy):
             self._handle_instrument_ready(instrument)
             return
         self.telemetry.log("⌛ 合约尚未出现在缓存中，等待交易所回调。", str(self._instrument_id))
+
+    def on_historical_data(self, data: Any) -> None:  # pragma: no cover - 依赖 Nautilus 回调
+        bars: List["Bar"] = []
+        if isinstance(data, Bar):
+            bars = [data]
+        else:
+            raw = getattr(data, "data", None)
+            if raw is None:
+                try:
+                    raw = list(data)  # type: ignore[arg-type]
+                except Exception:  # noqa: BLE001
+                    raw = None
+
+            if raw is not None:
+                try:
+                    iterator = list(raw)
+                except TypeError:
+                    iterator = []
+                except Exception:  # noqa: BLE001
+                    iterator = []
+
+                for item in iterator:
+                    if isinstance(item, Bar) or hasattr(item, "instrument_id"):
+                        bars.append(item)
+        if not bars:
+            self.telemetry.log("🛰️ 历史数据无法解析，忽略", str(getattr(data, "instrument_id", "HIST")))
+            return
+
+        first = bars[0]
+        instrument_id = getattr(first, "instrument_id", None)
+        bar_type = getattr(first, "bar_type", None)
+        ctx = self._get_context(instrument_id or getattr(first, "symbol", None), bar_type)
+        if ctx is None:
+            return
+
+        bars.sort(key=lambda bar: getattr(bar, "end_time", self.clock.utc_now()))
+        with self._activate_context(ctx):
+            self.telemetry.log(
+                f"🛰️ 历史片段解包 {len(bars)} 条", str(self._instrument_id)
+            )
+            for bar in bars:
+                self._append_bar(bar)
+            self._bootstrap_requested = False
+            self.telemetry.log(
+                f"📚 历史 K 线补齐：新增 {len(bars)} 根，现有缓存 {len(self._history)} 根。",
+                str(self._instrument_id),
+            )
+            if (
+                self._force_initial_analysis
+                and not self._initial_analysis_done
+                and len(self._history) >= self._instrument_config.min_history
+            ):
+                last_bar = bars[-1]
+                self._maybe_trigger_analysis(last_bar, "启动强制分析", force=True)
+                self._initial_analysis_done = True
+
+    def on_data(self, data: Any) -> None:  # pragma: no cover - 依赖 Nautilus 回调
+        is_hist = bool(getattr(data, "is_historical", False))
+        data_type = type(data).__name__
+        sample_id = getattr(data, "instrument_id", None) or getattr(data, "symbol", None)
+        if is_hist:
+            self.telemetry.log(
+                f"🛰️ 历史数据载荷：{data_type}, instrument={sample_id}",
+                str(sample_id or "HIST"),
+            )
+            self.on_historical_data(data)
+            return
+        super().on_data(data)  # type: ignore[misc]
+
+    # ------------------------------------------------------------------ #
+    # 外部注入历史数据（REST 预热）
+    # ------------------------------------------------------------------ #
+
+    def ingest_external_history(
+        self,
+        history: Dict[str, List[dict]],
+        *,
+        trigger_analysis: bool = False,
+        trigger_reason: str = "启动强制分析",
+    ) -> None:
+        """供 runtime 在 TradingNode 启动前手动注入历史 K 线。"""
+
+        if not history:
+            return
+
+        if trigger_analysis:
+            self._ensure_services_ready()
+
+        for instrument_id, rows in history.items():
+            ctx = self._contexts.get(instrument_id)
+            if ctx is None:
+                continue
+            with self._activate_context(ctx):
+                ctx._history.clear()
+                parsed = []
+                for row in sorted(rows, key=lambda item: item.get("date")):
+                    date = row.get("date")
+                    if not isinstance(date, datetime):
+                        continue
+                    parsed.append(
+                        {
+                            "date": date,
+                            "open": float(row.get("open", 0.0)),
+                            "high": float(row.get("high", 0.0)),
+                            "low": float(row.get("low", 0.0)),
+                            "close": float(row.get("close", 0.0)),
+                            "volume": float(row.get("volume", 0.0)),
+                        }
+                    )
+                for item in parsed[-ctx.config.bar_history :]:
+                    ctx._history.append(item)
+                if ctx._history:
+                    ctx._last_price = ctx._history[-1]["close"]
+                ctx._history_log_flag = len(ctx._history) >= ctx.config.min_history
+                self.telemetry.log(
+                    f"🪣 外部注入历史：{len(parsed)} 条，缓存 {len(ctx._history)} 条。",
+                    str(ctx._instrument_id),
+                )
+
+                if (
+                    trigger_analysis
+                    and not ctx._initial_analysis_done
+                    and len(ctx._history) >= ctx.config.min_history
+                ):
+                    last_row = ctx._history[-1]
+                    fake_bar = SimpleNamespace(
+                        end_time=last_row["date"],
+                        close=last_row["close"],
+                        is_historical=True,
+                    )
+                    self._maybe_trigger_analysis(fake_bar, trigger_reason, force=True)
+                    ctx._initial_analysis_done = True
+
+    def _ensure_services_ready(self) -> None:
+        ai = getattr(self, "ai_service", None)
+        if ai is None:
+            return
+        already_ready = getattr(ai, "_initialized", False)
+        if already_ready:
+            return
+        try:
+            ai.initialize()
+        except Exception as exc:  # noqa: BLE001
+            self.telemetry.log(f"⚠️ AI 服务初始化失败：{exc}", "SYSTEM")
 
     def _fetch_cached_instrument(self) -> Optional[Instrument]:
         try:
@@ -449,7 +630,12 @@ class LLMStrategy(Strategy):
     def _bar_interval_seconds(self) -> Optional[int]:
         spec = getattr(self._bar_type, "bar_spec", None)
         if spec is None:
-            return None
+            # 某些外部 BarType（如 Binance EXTERNAL）不会携带 bar_spec，此时尝试根据配置推断间隔
+            hint = getattr(self._instrument_config, "binance_interval", None)
+            seconds = self._interval_hint_to_seconds(hint)
+            if seconds is not None:
+                return seconds
+            return self._infer_interval_from_bar_type(str(self._bar_type))
 
         step = getattr(spec, "step", None)
         aggregation = getattr(spec, "aggregation", None)
@@ -476,6 +662,98 @@ class LLMStrategy(Strategy):
             return None
         return step_value * base
 
+    @staticmethod
+    def _interval_hint_to_seconds(value: Optional[str]) -> Optional[int]:
+        if not value:
+            return None
+        text = value.strip().lower()
+        if not text:
+            return None
+
+        suffix_map = {
+            "s": 1,
+            "sec": 1,
+            "secs": 1,
+            "second": 1,
+            "seconds": 1,
+            "m": 60,
+            "min": 60,
+            "mins": 60,
+            "minute": 60,
+            "minutes": 60,
+            "h": 3600,
+            "hr": 3600,
+            "hour": 3600,
+            "hours": 3600,
+            "d": 86400,
+            "day": 86400,
+            "days": 86400,
+            "w": 604800,
+            "week": 604800,
+            "weeks": 604800,
+        }
+
+        for suffix, multiplier in suffix_map.items():
+            if text.endswith(suffix):
+                number_part = text[: -len(suffix)].strip()
+                try:
+                    value_num = float(number_part)
+                except ValueError:
+                    continue
+                if value_num <= 0:
+                    continue
+                return int(value_num * multiplier)
+
+        # 像 "5m"、"1h" 一类可能未被上方捕获（因短后缀重叠），单独尝试解析
+        if text[-1:] in {"s", "m", "h", "d", "w"}:
+            try:
+                value_num = float(text[:-1])
+            except ValueError:
+                return None
+            multiplier = {
+                "s": 1,
+                "m": 60,
+                "h": 3600,
+                "d": 86400,
+                "w": 604800,
+            }[text[-1:]]
+            if value_num > 0:
+                return int(value_num * multiplier)
+        return None
+
+    @staticmethod
+    def _infer_interval_from_bar_type(name: str) -> Optional[int]:
+        if not name:
+            return None
+        parts = name.replace("_", "-").split("-")
+        for idx, part in enumerate(parts):
+            if not part.isdigit():
+                continue
+            if idx + 1 >= len(parts):
+                continue
+            unit = parts[idx + 1].upper()
+            try:
+                value_num = int(part)
+            except ValueError:
+                continue
+            if value_num <= 0:
+                continue
+            multiplier = {
+                "SECOND": 1,
+                "SECONDS": 1,
+                "SEC": 1,
+                "MINUTE": 60,
+                "MINUTES": 60,
+                "MIN": 60,
+                "HOUR": 3600,
+                "HOURS": 3600,
+                "DAY": 86400,
+                "DAYS": 86400,
+            }.get(unit)
+            if multiplier is not None:
+                return value_num * multiplier
+        return None
+
     def _subscribe_market_data(self) -> None:
         if self._bars_subscribed:
             return
@@ -498,7 +776,7 @@ class LLMStrategy(Strategy):
         self.telemetry.log("📡 已订阅 5m 行情。", str(self._instrument_id))
 
     def on_bar(self, bar: Bar) -> None:  # pragma: no cover - 依赖 Nautilus 回调
-        ctx = self._get_context(getattr(bar, "instrument_id", None))
+        ctx = self._get_context(getattr(bar, "instrument_id", None), getattr(bar, "bar_type", None))
         if ctx is None:
             return
         with self._activate_context(ctx):
@@ -506,20 +784,59 @@ class LLMStrategy(Strategy):
 
     def _on_bar_context(self, bar: Bar) -> None:
         self._append_bar(bar)
+        is_historical = bool(getattr(bar, "is_historical", False))
+        if is_historical:
+            if (
+                self._force_initial_analysis
+                and not self._initial_analysis_done
+                and len(self._history) >= self._instrument_config.min_history
+            ):
+                self.telemetry.log(
+                    (
+                        f"🧭 首轮分析触发：历史样本 {len(self._history)} 根，"
+                        "即将执行启动强制分析。"
+                    ),
+                    str(self._instrument_id),
+                )
+                self._maybe_trigger_analysis(bar, "启动强制分析", force=True)
+                self._initial_analysis_done = True
+            return
+
+        if (
+            self._force_initial_analysis
+            and not self._initial_analysis_done
+            and len(self._history) >= self._instrument_config.min_history
+        ):
+            self.telemetry.log(
+                (
+                    f"🧭 首轮分析触发：实时样本 {len(self._history)} 根，"
+                    "即将执行启动强制分析。"
+                ),
+                str(self._instrument_id),
+            )
+            self._maybe_trigger_analysis(bar, "启动强制分析", force=True)
+            self._initial_analysis_done = True
+            return
+
+        self._maybe_trigger_analysis(bar, "定期分析", force=False)
+
+    def _maybe_trigger_analysis(self, bar: Bar, reason_hint: str, *, force: bool) -> None:
         if len(self._history) < self._instrument_config.min_history:
             return
 
         now_ts = bar.end_time.timestamp() if hasattr(bar, "end_time") else self.clock.utc_now().timestamp()
-        reason_text = "定期分析"
-        if now_ts - self._last_analysis_ts < self._instrument_config.analysis_cooldown_secs:
-            should, reason = self._trigger_manager.should_analyze(
-                self._history_df,
-                self._instrument_config.analysis_cooldown_secs,
-            )
-            if not should:
-                self._pending_trigger_reason = ""
-                return
-            reason_text = reason or "触发器命中"
+        reason_text = reason_hint if force else "定期分析"
+
+        if not force:
+            if now_ts - self._last_analysis_ts < self._instrument_config.analysis_cooldown_secs:
+                should, reason = self._trigger_manager.should_analyze(
+                    self._history_df,
+                    self._instrument_config.analysis_cooldown_secs,
+                )
+                if not should:
+                    self._pending_trigger_reason = ""
+                    return
+                reason_text = reason or "触发器命中"
         self._pending_trigger_reason = reason_text
         if reason_text:
             self.telemetry.log(f"📊 触发分析原因：{reason_text}", str(self._instrument_id))
@@ -934,6 +1251,14 @@ class LLMStrategy(Strategy):
         }
         self._history.append(row)
         self._last_price = row["close"]
+        if not self._history_log_flag:
+            prefix = "历史" if getattr(bar, "is_historical", False) else "实时"
+            self.telemetry.log(
+                f"🧮 {prefix} K 线追加：当前缓存 {len(self._history)} / {self._instrument_config.min_history}",
+                str(self._instrument_id),
+            )
+            if len(self._history) >= self._instrument_config.min_history:
+                self._history_log_flag = True
 
     @property
     def _history_df(self) -> pd.DataFrame:

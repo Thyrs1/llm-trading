@@ -13,6 +13,9 @@ from nautilus_bot.data.downloader import ensure_catalog_data
 from nautilus_bot.risk import RiskController
 from nautilus_bot.strategy.llm_strategy import InstrumentSpec, LLMStrategy, LLMStrategyConfig
 from nautilus_bot.telemetry import TelemetryStore
+from nautilus_bot.data.binance_rest import fetch_recent_klines, BinanceRESTError
+
+DEFAULT_BINANCE_INTERVAL = "5m"
 
 try:  # pragma: no cover
     from nautilus_trader.adapters.binance import (
@@ -87,10 +90,10 @@ async def run_live(settings: BotSettings) -> None:
 
     node = await _build_trading_node(settings, specs)
     strategy = _build_strategy(settings, specs, ai_service, risk, telemetry)
+    _prefetch_strategy_history(settings, specs, strategy, telemetry)
     trader = node.trader
     trader.add_strategy(strategy)
-    trader.start_strategy(strategy.id)
-    telemetry.log("🤖 已注册多标的 LLM Strategy。", "SYSTEM")
+    telemetry.log("🤖 已注册多标的 LLM Strategy，TradingNode 启动后将自动拉起策略。", "SYSTEM")
 
     vitals_task = asyncio.create_task(_poll_account_vitals(node, telemetry, risk))
     telemetry.log("🚀 Nautilus TradingNode 已就绪，开始运行。")
@@ -187,6 +190,7 @@ def _build_strategy(
         instruments=list(specs),
         initial_equity=initial_balance,
         initial_available_margin=initial_balance,
+        force_initial_analysis=settings.strategy.force_initial_analysis,
     )
     return LLMStrategy(
         config=strategy_config,
@@ -194,6 +198,39 @@ def _build_strategy(
         risk_controller=risk,
         telemetry=telemetry,
     )
+
+
+def _prefetch_strategy_history(
+    settings: BotSettings,
+    specs: Sequence[InstrumentSpec],
+    strategy: LLMStrategy,
+    telemetry: TelemetryStore,
+) -> None:
+    if not settings.strategy.force_initial_analysis:
+        return
+
+    history: Dict[str, List[dict]] = {}
+    base_url = settings.binance.base_http_url or None
+    for spec in specs:
+        symbol = spec.binance_symbol or settings.strategy.binance_symbol or spec.instrument_id.split("-")[0]
+        interval = spec.binance_interval or settings.strategy.binance_interval or DEFAULT_BINANCE_INTERVAL
+        limit = max(int(spec.min_history), 1)
+        try:
+            rows = fetch_recent_klines(symbol=symbol, interval=interval, limit=limit, base_http_url=base_url)
+        except BinanceRESTError as exc:
+            telemetry.log(f"⚠️ Binance 历史数据拉取失败：{exc}", str(spec.instrument_id))
+            continue
+        if not rows:
+            telemetry.log("⚠️ Binance 返回空历史数据。", str(spec.instrument_id))
+            continue
+        history[spec.instrument_id] = rows
+        telemetry.log(
+            f"🗂️ Binance 历史预取完成：{len(rows)} 条。",
+            str(spec.instrument_id),
+        )
+
+    if history:
+        strategy.ingest_external_history(history, trigger_analysis=True)
 
 
 def _instrument_specs(settings: BotSettings) -> List[InstrumentSpec]:

@@ -95,6 +95,7 @@ class StrategySettings:
     default_leverage: float = 10.0
     max_leverage: float = 50.0
     instruments: List[InstrumentSettings] = field(default_factory=list)
+    force_initial_analysis: bool = False
 
 
 @dataclass(slots=True)
@@ -241,6 +242,8 @@ def _apply_file_overrides(settings: BotSettings, data: Dict[str, Any]) -> None:
     )
     settings.strategy.binance_symbol = strat_cfg.get("binance_symbol", settings.strategy.binance_symbol)
     settings.strategy.binance_interval = strat_cfg.get("binance_interval", settings.strategy.binance_interval)
+    if "force_initial_analysis" in strat_cfg:
+        settings.strategy.force_initial_analysis = bool(strat_cfg.get("force_initial_analysis"))
 
     base_instrument = InstrumentSettings(
         instrument_id=settings.strategy.instrument_id,

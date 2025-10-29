@@ -39,6 +39,7 @@ order_id_tag = "LLM"
 analysis_cooldown_secs = 300
 default_leverage = 10.0
 max_leverage = 50.0
+force_initial_analysis = false
 
 # 可选：批量定义多合约配置，未填写时沿用上方默认值
 # [[strategy.instruments]]
